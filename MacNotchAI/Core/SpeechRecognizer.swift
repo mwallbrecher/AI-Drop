@@ -51,11 +51,12 @@ final class SpeechRecognizer: ObservableObject {
                 return
             }
 
-            // Step 2 — microphone permission.
-            // On macOS 26 AVCaptureDevice correctly maps to kTCCServiceMicrophone;
-            // AVAudioApplication checks a separate TCC category that defaults to .denied.
-            // Drop the overlay to .normal first so the TCC dialog isn't hidden behind it.
-            let micStatus = AVCaptureDevice.authorizationStatus(for: .audio)
+            // Step 2 — microphone permission. WHICH API owns the audio-recording TCC
+            // category flipped in macOS 26 (lessons MIC-04/05): on 14/15 it's
+            // AVAudioApplication (AVCaptureDevice returns a false .denied); on 26 it's
+            // AVCaptureDevice (AVAudioApplication defaults .denied for accessory apps).
+            // `micAuthStatus()` / `requestMicAccess()` pick the right one per OS.
+            let micStatus = micAuthStatus()
 
             if micStatus != .authorized {
                 guard micStatus == .notDetermined else {
@@ -64,13 +65,13 @@ final class SpeechRecognizer: ObservableObject {
                     return
                 }
 
+                // Drop the overlay to .normal so the TCC dialog isn't hidden behind the
+                // floating pill (MIC-06); restore .floating after.
                 let overlayWindow = NSApp.windows.first { $0 is OverlayWindow }
                 overlayWindow?.level = .normal
                 NSApp.activate(ignoringOtherApps: true)
 
-                let micOK = await withCheckedContinuation { (cont: CheckedContinuation<Bool, Never>) in
-                    AVCaptureDevice.requestAccess(for: .audio) { cont.resume(returning: $0) }
-                }
+                let micOK = await requestMicAccess()
 
                 overlayWindow?.level = .floating
                 guard micOK else {
@@ -202,6 +203,43 @@ final class SpeechRecognizer: ObservableObject {
         recognizer   = nil
         onTranscript = nil
         isRecording  = false
+    }
+
+    // MARK: - Microphone permission (OS-version-aware)
+
+    private enum MicAuth { case authorized, denied, notDetermined }
+
+    /// Microphone auth status, read from the API that actually maps to
+    /// `kTCCServiceMicrophone` on the RUNNING OS. macOS 26 flipped which API owns the
+    /// audio-recording TCC category (lessons MIC-04/05) — using the wrong one yields a
+    /// false `.denied`. 26+ → `AVCaptureDevice`; 14/15 → `AVAudioApplication`.
+    private func micAuthStatus() -> MicAuth {
+        if #available(macOS 26, *) {
+            switch AVCaptureDevice.authorizationStatus(for: .audio) {
+            case .authorized:    return .authorized
+            case .notDetermined: return .notDetermined
+            default:             return .denied
+            }
+        } else {
+            switch AVAudioApplication.shared.recordPermission {
+            case .granted:      return .authorized
+            case .undetermined: return .notDetermined
+            default:            return .denied
+            }
+        }
+    }
+
+    /// Request mic access via the OS-correct API (see `micAuthStatus`). Returns granted.
+    private func requestMicAccess() async -> Bool {
+        if #available(macOS 26, *) {
+            return await withCheckedContinuation { (cont: CheckedContinuation<Bool, Never>) in
+                AVCaptureDevice.requestAccess(for: .audio) { cont.resume(returning: $0) }
+            }
+        } else {
+            return await withCheckedContinuation { (cont: CheckedContinuation<Bool, Never>) in
+                AVAudioApplication.requestRecordPermission { cont.resume(returning: $0) }
+            }
+        }
     }
 
     // MARK: - Permission alerts

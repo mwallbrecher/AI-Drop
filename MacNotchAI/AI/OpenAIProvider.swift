@@ -12,7 +12,7 @@ final class OpenAIProvider: AIProvider {
     init(apiKey: String) { self.apiKey = apiKey }
     var isAvailable: Bool { !apiKey.isEmpty }
 
-    func complete(action: AIAction, content: String, imageURL: URL?) async throws -> String {
+    func reply(messages: [ChatTurn], imageURL: URL?, plan: RoutingPlan) async throws -> String {
         guard isAvailable else { throw AIError.noAPIKey(provider: name) }
 
         var request = URLRequest(url: URL(string: baseURL)!)
@@ -20,26 +20,10 @@ final class OpenAIProvider: AIProvider {
         request.setValue("Bearer \(apiKey)", forHTTPHeaderField: "Authorization")
         request.setValue("application/json", forHTTPHeaderField: "Content-Type")
 
-        var userContent: Any = content
-
-        if let imageURL, FileInspector.isImageFile(imageURL),
-           let imageData = try? Data(contentsOf: imageURL) {
-            let base64 = imageData.base64EncodedString()
-            let ext = imageURL.pathExtension.lowercased()
-            let mime = (ext == "jpg" || ext == "jpeg") ? "image/jpeg" : "image/png"
-            userContent = [
-                ["type": "image_url", "image_url": ["url": "data:\(mime);base64,\(base64)"]],
-                ["type": "text", "text": action.systemPrompt]
-            ]
-        }
-
         let body: [String: Any] = [
             "model": model,
-            "messages": [
-                ["role": "system", "content": action.systemPrompt],
-                ["role": "user",   "content": userContent]
-            ],
-            "max_tokens": 1024,
+            "messages": openAICompatMessages(messages, imageURL: imageURL, attachImage: true),
+            "max_tokens": plan.maxOutputTokens,
             "temperature": 0.3
         ]
         request.httpBody = try JSONSerialization.data(withJSONObject: body)

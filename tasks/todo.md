@@ -6,6 +6,396 @@
 
 ---
 
+## STATUS — 2026-06-01
+
+- **Hosted-tier code: all DONE + build green.** Token-budget quota, model routing, 3rd tier, content caps.
+- **D1 migrations: APPLIED** (owner) — `usage.tokens` + `accounts.pro` columns added.
+- **`wrangler deploy`: confirm it ran** — the migrations are inert until the new Worker code is live.
+- **Manual tests: PASS** (owner) — multi-file, Finder Quick Action, conversation, minimize, file tools, history.
+- **Paddle / payments: DEFERRED on purpose** — wire up only if the app gets real usage. `isPremiumUnlocked`
+  stays `false`; Pro is reachable solely by a manual D1 `pro=1` flag for testing. Bill is bounded
+  meanwhile by `GLOBAL_DAILY_CAP` (2000 interactions/day) regardless of device-id spoofing.
+
+---
+
+## Feature — Pillar 1 MVP: Favorite Tools + drop-to-launch hotkeys (PLANNED — awaiting go-ahead)
+
+> 2026-06-01. First slice of the product reframe (`docs/VISION.md`): the notch becomes a router, not
+> just an AI surface. Drop a file → a numbered row of YOUR apps appears → click or `Option+1…9` opens
+> the file there. **Tool list = manual favorites** (owner decided). Smallest build that proves the
+> "your tools, one drag away" story. AI chips stay — tools are an added lane, not a replacement.
+
+**Design decisions (flag if you disagree):**
+- Tools shown as a **numbered row inside the `.chips` stage**, below/beside the AI action chips
+  (respects `uiScale` + `.liquidGlass`). Number badge = the `Option+N` it maps to.
+- Hotkeys via a **local `NSEvent` keyDown monitor** installed only while the chips stage is live
+  (no Accessibility needed — local monitors catch our own app's events; auto-removed on stage exit).
+- Launch opens **all staged files** (multi-file aware) in the chosen app, then **dismisses** the overlay.
+- Empty state: no favorites → row hidden + a one-line "Add tools in Settings" hint (no dead UI).
+- Number assignment: auto `1…9` by order; reorder/remove in Settings.
+
+**Plan:**
+- [ ] **`Models/FavoriteToolsStore.swift`** (new, `@MainActor ObservableObject`, PromptStore-style):
+      `FavoriteTool { id, bundleURL/bundleID, name, order }`; persisted JSON in App Support (or a small
+      UserDefaults Codable array). `add(appURL:)`, `remove(_:)`, `move(...)`, `tools` (ordered, capped 9).
+      Icons resolved on demand via `NSWorkspace.shared.icon(forFile:)` (not persisted).
+- [ ] **Launch path** — generalize the `HandoffManager` idea into `openFiles(_ urls:in tool:)` using
+      `NSWorkspace.shared.openApplication(at:configuration:)` / `open(_:withApplicationAt:…)`. Open ALL
+      staged URLs (`vm.allFileURLs`). On success → `NotificationCenter.post(.hideOverlay)`.
+- [ ] **Settings UI** (in `SettingsView`) — "Favorite Tools" section: add via `NSOpenPanel`
+      (filter `.application` bundles, default `/Applications`), list with icon + name + `Option+N` badge,
+      remove, drag-reorder. Cap at 9 (the hotkey range).
+- [ ] **Tool row view** (new, e.g. `UI/ToolRow.swift`) rendered in the chips stage: per-tool button
+      (app icon + name + number badge), click → launch. Hidden when no favorites (+ the hint).
+      Hook into `OverlayView` chips stage; size via the existing `resizeOverlay` per-stage `CGSize`
+      (adjust the chips-stage height to fit the row — Combine loop, not SwiftUI layout; CLAUDE invariant).
+- [ ] **Hotkeys** — local keyDown monitor active during `.chips`: `Option+1…9` → launch favorite N.
+      Install on stage-enter, remove on stage-exit (and in `hideOverlay`/`reset`). Validate it doesn't
+      eat the prompt field's own keys (monitor returns the event through unless it's a matched chord).
+- [ ] **Build green** + manual exercise: drag file → row shows favorites → click opens in app;
+      `Option+2` opens in the 2nd app; multi-file drop opens all; empty-favorites shows the hint.
+- [ ] Update `docs/VISION.md` Pillar 1 status + `CLAUDE.md` (new store/view + the local-monitor pattern).
+- [ ] Capture a lesson if the hotkey monitor / focus interaction bites (likely candidate).
+
+**Explicitly NOT in this MVP** (later pillars): file utilities (convert/compress), AI→tool bridges,
+destinations (Slack/Notion), saved workflows, auto-detecting installed apps. Keep it thin.
+
+---
+
+## Feature — Lower deployment target macOS 26 → 14 (PLANNED — awaiting go-ahead)
+
+> 2026-06-01. Owner wants older-OS reach. Chose **macOS 14 (Sonoma)** target (not 13 — 13 would force
+> rewriting the 4 animated SF Symbols; 14 keeps them). **No older-OS test machine** → the 14/15 branch
+> ships runtime-UNVERIFIED; the macOS-26 path stays byte-identical and IS verified on the dev machine.
+> Good news: the glass look is custom (`NSVisualEffectView` + gradients), NOT the 26-only `glassEffect`
+> API → the whole aesthetic survives untouched.
+
+**The one real blocker — mic permission (per lessons MIC-01/04/05):**
+- macOS **14/15**: audio TCC is owned by `AVAudioApplication`; `AVCaptureDevice.authorizationStatus`
+  returns a false `.denied` (MIC-04). → must use `AVAudioApplication.shared.recordPermission` +
+  `AVAudioApplication.requestRecordPermission`.
+- macOS **26**: reversed — `AVAudioApplication` defaults `.denied` for accessory apps; `AVCaptureDevice`
+  maps to `kTCCServiceMicrophone` correctly (MIC-05). → keep the current `AVCaptureDevice` path.
+- Current code = AVCaptureDevice ONLY → dictation would break on 14/15. Fix = `if #available(macOS 26, *)`
+  split, restoring the documented MIC-04 path behind the guard.
+
+**Plan:** (code DONE 2026-06-01 — build green; owner runtime-test owed)
+- [x] Set `MACOSX_DEPLOYMENT_TARGET = 14.0` — done at the **project level** (pbxproj lines 300/358);
+      neither target overrides it, so app + AddToAIDrop both inherit 14. No `LSMinimumSystemVersion` present.
+- [x] Built target 14 against the 26 SDK → **ZERO availability errors**. No 26-only APIs in the code
+      (Liquid Glass is custom; `.symbolEffect`×4 are 14+). So **no `#available` guards needed anywhere**.
+- [x] **`SpeechRecognizer` Step 2 OS-split** added: `micAuthStatus()` / `requestMicAccess()` branch on
+      `if #available(macOS 26, *)` — 26 → AVCaptureDevice (unchanged); 14/15 → AVAudioApplication (MIC-04).
+      MIC-06 overlay-level drop kept in the shared path. 26 behavior byte-identical.
+- [x] Info.plist mic/speech usage strings already present (`INFOPLIST_KEY_NS*UsageDescription`, pbxproj
+      both configs) — no change needed.
+- [x] **Clean build green** at target 14 (`** BUILD SUCCEEDED **`).
+- [x] README `macOS 13+` → `macOS 14+`; CLAUDE.md deployment-target + known-gaps updated; lesson MIC-11 added.
+- [ ] **OWNER — verify the 26 runtime path unchanged on THIS machine:** drag→drop→action + dictation
+      (mic prompt + transcription). Should be identical to before (26 branch untouched).
+- [ ] **OWNER, when you get a 14/15 box/VM:** verify dictation actually prompts + records there. Until
+      then the 14/15 mic branch is code-reviewed but NOT runtime-proven (the #1 residual risk).
+
+---
+
+## Feature — Spend instrumentation (§8) (code DONE — NEEDS deploy + secret + table)
+
+> 2026-06-01. Owner priority is the API bill; this gives eyes on it. We already capture real
+> tokens per call — this rolls them up so you can see spend and tune routing on data, not vibes.
+> Server-side only, no app release. Per-action breakdown deferred (needs the client to send the
+> action name; today only `tier` is sent).
+
+- [x] **`spend` table** (`schema.sql`): per day × model-billed × requested-tier, splitting
+      `prompt_tokens` / `completion_tokens` so cost is estimable. `PRIMARY KEY(day, model, tier)`.
+- [x] **Worker writes it best-effort** after each successful call (`index.js`, `.catch(()=>{})` so a
+      logging failure never breaks a user response). Tracks `usedModel` (incl. the fallback model),
+      normalizes the tier hint to `fast|strong|extra|other`. `callGemini` now returns split in/out tokens.
+- [x] **Spend write is OFF the response path** — wrapped in `ctx.waitUntil()` so it runs *after* the
+      response is sent (zero user-facing latency). `handleComplete(request, env, ctx)`. Falls back to a
+      plain `await` if `ctx` is missing. The consume/global-usage writes stay awaited (they gate the next
+      request's limits → must be race-free).
+- [x] **`GET /v1/stats`** — admin-guarded by the `ADMIN_TOKEN` secret (unset ⇒ endpoint closed).
+      `?days=N` (default 7, max 90). Returns per-row + totals with `est_usd` from a list-price map
+      (flash-lite/flash/pro; unknown model ⇒ $0). Cost math verified offline.
+- [x] `node --check` clean. Cost/reduce logic sanity-checked (164-call sample ≈ $0.41).
+- [ ] **USER ACTION 1:** `wrangler secret put ADMIN_TOKEN` (any long random string).
+- [ ] **USER ACTION 2:** create the table — `wrangler d1 execute aidrop --remote --file=./schema.sql`
+      (re-runs all `CREATE TABLE IF NOT EXISTS` — harmless to repeat).
+- [ ] **USER ACTION 3:** `cd worker && wrangler deploy`.
+- [ ] **Read it:** `curl -H "X-Admin-Token: <token>" https://aidrop.aidrop.workers.dev/v1/stats?days=7`
+- [ ] FUTURE: send the action name from the client → per-action spend; optional simple HTML dashboard.
+
+---
+
+## Feature — 2× char caps + token-budget daily quota (code DONE — NEEDS deploy + D1 migration)
+
+> Goal (owner): "double the max chars for free and paid users on every model; change the daily
+> limit from flat interactions to 3× the maxchar for free and 10× for pro." Then, asked "is chars
+> the right unit? we also have images" — owner chose to **meter actual upstream tokens** (chars
+> miss image bytes). Priority unchanged: the operator's bill comes first; per-user cap is a relief valve.
+
+- [x] **Doubled all char caps.** Client `FileContentExtractor.maxChars` 12k→**24k**, `maxCharsPro`
+      24k→**48k**. Worker `MAX_CONTENT_CHARS` 20k→**40k**, `MAX_CONTENT_CHARS_PRO` 40k→**80k**
+      (`wrangler.toml` + `readLimits` defaults). These now serve as the **pre-flight input guard**
+      (char-based, checked before the call — token cost isn't known until after). Client cap stays
+      below the Worker cap on purpose — headroom for the document riding every multi-turn request.
+- [x] **Daily quota: flat interactions → TOKEN budget.** Was `FREE_DAILY_CAP = 10`/day. Now metered on
+      the **actual tokens Gemini bills** (input + output), read from each response's `usage` block — so
+      images, PDFs and text all debit fairly (a char count misses image bytes). `FREE_DAILY_TOKENS = 30000`
+      (~3 full free requests), `PRO_DAILY_TOKENS = 200000` (~10 full pro requests). Tunable server-side,
+      no app update. Fallback: if upstream `usage` is missing, estimate `chars/4` so nothing meters free.
+- [x] **Trial unchanged (interaction-based, 30 lifetime); Pro bypasses the trial** → straight to its
+      big daily token budget. Gate is "already-consumed ≥ budget" (last request may slightly overshoot —
+      a relief valve, per-request char cap bounds the spill). Global circuit-breaker left interaction-based
+      (coarse abuse valve).
+- [x] **Schema:** `usage` gains a `tokens` column (kept `count` for instrumentation + the global breaker).
+      Upsert bumps both; `callGemini` now returns `tokens` from the upstream `usage`. `worker/schema.sql` updated.
+- [x] **Usage payload reshaped** (`/v1/complete` + `/v1/usage`): drops `dailyRemaining`/`remaining`, adds
+      `dailyTokenBudget` + `dailyTokensRemaining` + `tier:"pro"`. Client `HostedUsage`/`UsageStore` mirror it;
+      menu shows trial interactions ("8 free left") then a daily **percentage** ("73% free today") since
+      raw token counts mean nothing to the user.
+- [x] Build green (`** BUILD SUCCEEDED **`) + `node --check` OK.
+- [ ] **USER ACTION 1:** `cd worker && wrangler deploy` (pushes the metering redesign + doubled caps).
+- [x] **USER ACTION 2 (one-time, existing DB):**
+      `ALTER TABLE usage ADD COLUMN tokens INTEGER NOT NULL DEFAULT 0` — APPLIED.
+- [x] Manual test — PASS.
+- [ ] FUTURE (spec §8): model-weighted cost-credits — a gemini-2.5-pro token costs ~4× a flash token;
+      raw-token metering treats them equally. Fine for now (pro budget is large, `extra` fires rarely).
+
+---
+
+## Fix — Worker realigned to the multi-turn client + honors output ceilings (code DONE — NEEDS `wrangler deploy`)
+
+> 2026-05-31. Found the live Worker (`worker/src/index.js`) still spoke the OLD single-shot contract
+> (`content` string) while the app now sends multi-turn `messages` → every hosted call would 400. See
+> lessons [WORK-01]. User chose "fix it + honor ceilings" (server-only; model routing deferred).
+
+- [x] `/v1/complete` now reads `messages: [{role,content}]` (legacy `content` string still accepted),
+      forwards the FULL conversation to Gemini (multi-turn), and bounds cost by total chars across turns.
+- [x] Honors `body.max_tokens` (the per-action ceiling the app already sends) with Gemini thinking-headroom
+      `max(requested + 1024, 2048)` + `reasoning_effort: low` — kills the server-side 2.5-Flash cut-off
+      (a truncated answer = a wasted paid call + a retry = paying twice).
+- [x] Image inlined into the first user turn (same shape as BYOK providers). `node --check` clean.
+- [ ] **USER ACTION:** `cd worker && wrangler deploy` to push this live, then test the free tier end-to-end
+      (set tier to non-BYOK, drop a file, run an action + a follow-up).
+- [x] Model routing by tier — DONE in the block below (no longer deferred).
+
+---
+
+## Feature — Worker model routing by tier (#1 bill lever) (code DONE — NEEDS `wrangler deploy`)
+
+> 2026-05-31. The labeled "#1 lever" from `docs/HOW_LLM_IS_CHOSEN.md` §4/§9. Route mechanical, bounded
+> work to the cheap model and keep the capable model only where judgement matters — the single biggest
+> cut to the operator's bill. Owner constraint: "I hate hardcoding keywords" → keywords must be
+> NON-LOAD-BEARING; flash is the floor; we never *rely* on a keyword to decide quality.
+
+- [x] App already ships `tier` (`plan.tier.rawValue`) on every `/v1/complete` call (HostedProvider).
+- [x] `AIAction.routing`: deterministic `switch` (no keywords) maps each built-in chip's task class →
+      `.fast` (extraction/short-summary/translate/rephrase/docstring/altText/OCR) or `.strong`
+      (explain/findBugs/refactor/describeImage/freeform).
+- [x] `RoutingPlan.forCustomPrompt`: floor = `.strong` (flash); keyword list may ONLY downgrade a short,
+      obviously-trivial prompt to `.fast`. Delete the list → reverts to always-flash. Never escalates.
+- [x] Worker `pickModel(env, tier)`: honours only an explicit `"fast"` → `GEMINI_MODEL_FAST`
+      (gemini-2.5-flash-lite); missing/unknown/malformed → `GEMINI_MODEL` (gemini-2.5-flash). Tier is an
+      UNTRUSTED hint — a bad tier degrades cost, never quality.
+- [x] Worker retry: if the routed (cheap) model call fails, retry once on the strong default before
+      erroring (`result.ok` check, `model !== strongModel`). User gets an answer, not a 502.
+- [x] `wrangler.toml`: added `GEMINI_MODEL_FAST = "gemini-2.5-flash-lite"`. `node --check` clean; app
+      build green.
+- [ ] **USER ACTION:** `cd worker && wrangler deploy` to push the model map live, then test: a mechanical
+      action (e.g. translate, summariseShort) should run on flash-lite; a reasoning action (explainCode,
+      findBugs) on flash. Both should still answer (retry + untrusted-hint fallback cover the failure modes).
+
+---
+
+## Feature — Third tier "extra strong" (Pro-only top model, used sparingly) (code DONE — NEEDS deploy)
+
+> 2026-05-31. SUPERSEDES the earlier "better model per tier" idea (too loose — auto-paid every call).
+> Owner: pro everyday experience = SAME fast/strong models as free (the win is the bigger char cap);
+> `extra` (gemini-2.5-pro) is a reserve used "only when really necessary", two ways: a tiny keyword-free
+> whitelist + a manual "Go deeper" button. Server-verified (`accounts.pro`, reuses `isPro`) — free can't
+> reach it. Owner constraint honoured: no keyword hardcoding; floor stays flash.
+
+- [x] Client `AITier` gains `.extraStrong` (rawValue `"extra"` — wire contract). `AIAction.routing`:
+      `findBugs`/`refactor` → `.extraStrong` (deep code reasoning); `explainCode` stays `.strong`.
+- [x] Manual escalation: `sendTurn(forceTier:regenerate:)` re-answers the last turn forced to
+      `.extraStrong` (drops stale assistant reply, no new user bubble). `RoutingPlan.with(tier:)` helper.
+- [x] UI: "sparkles" icon button in the result icon bar, gated `provider is HostedProvider &&
+      EntitlementStore.isPremiumUnlocked` (Pro + hosted only — BYOK has a fixed model, can't escalate).
+- [x] Worker `pickModel(env, tier, isPro)`: `fast→flash-lite`, `strong→flash`, `extra→GEMINI_MODEL_EXTRA`
+      (Pro) / `strong` (free degrade). Unknown tier → strong. `GEMINI_MODEL_EXTRA` optional → flash.
+- [x] `wrangler.toml`: replaced `GEMINI_MODEL_PRO`/`_FAST_PRO` with `GEMINI_MODEL_EXTRA = "gemini-2.5-pro"`.
+      App build green; `node --check` clean.
+- [ ] **USER ACTION:** `cd worker && wrangler deploy` (same deploy as the content-cap change).
+- [ ] **COST CHECK:** gemini-2.5-pro ≈ 4× flash / 12–25× flash-lite per token. It fires only on the
+      whitelist + manual button, but confirm the sub covers it; comment out `GEMINI_MODEL_EXTRA` to disable.
+- [ ] **Manual test (Pro):** mark device pro + make `isPremiumUnlocked` true → sparkles button appears in
+      result; tapping it re-answers on pro. findBugs/refactor auto-use pro; everything else stays flash.
+- [ ] NOT changed: output-token ceilings shared across tiers; PDF 20-page cap shared.
+
+---
+
+## Feature — Pro tier content cap (2× chars for subscribers) (code DONE — NEEDS deploy + D1 migration)
+
+> 2026-05-31. Pro/subscribers read twice as much of a file before the "analysed the first part only"
+> truncation. Client free `maxChars = 12_000` → pro `maxCharsPro = 24_000`; Worker free
+> `MAX_CONTENT_CHARS = 20000` → pro `MAX_CONTENT_CHARS_PRO = 40000`. Trust model: **server-verified**
+> (`accounts.pro`), chosen over trusting a client hint — a modified client must not be able to double
+> its own input spend.
+
+- [x] Client `FileContentExtractor`: added `maxCharsPro`; `extract(from:limit:)` + `capped(_:limit:)`
+      now take a cap. `buildMultiFileContent(…, charLimit:)` resolves it from
+      `EntitlementStore.isPremiumUnlocked` (false today → free cap; flips to 24k when Pro unlocks).
+- [x] Worker `wrangler.toml`: `MAX_CONTENT_CHARS` / `MAX_CONTENT_CHARS_PRO` vars (tunable, no deploy to change).
+- [x] Worker `index.js`: `readLimits` reads both; `isProDevice(env, deviceId)` reads `accounts.pro`
+      (server-trusted, try/catch-safe before migration, defaults free); content-size 413 uses the per-tier cap.
+- [x] `schema.sql`: `accounts.pro` column for fresh DBs + ALTER migration comment for the live DB.
+      App build green; `node --check` clean.
+- [ ] **USER ACTION 1:** `cd worker && wrangler deploy`.
+- [x] **USER ACTION 2 (one-time, existing DB):**
+      `ALTER TABLE accounts ADD COLUMN pro INTEGER NOT NULL DEFAULT 0` — APPLIED.
+- [ ] **To test the 40k path:** mark your device pro —
+      `wrangler d1 execute aidrop --remote --command "UPDATE accounts SET pro=1 WHERE device_id='<id>'"` —
+      and (client side) the 24k cap only activates once `EntitlementStore.isPremiumUnlocked` returns true.
+- [ ] NOT changed: PDF 20-page cap is shared across tiers (only char caps differ, per request).
+
+---
+
+## Feature — Prompt caching of the document prefix (DONE — build green)
+
+> Plan + impl 2026-05-31. `docs/HOW_LLM_IS_CHOSEN.md` §6 item 1 — "biggest real bill win after routing"
+> for the multi-turn chat subset. We re-send the document every turn; cache it so follow-ups read it ~90%
+> cheaper instead of paying full input price each time.
+
+- [x] `ChatTurn` gains `cacheableDocument: String?` (defaulted) + `flattenedContent` (folds doc back into
+      text byte-identically). `buildChatTurns` now puts the document on the FIRST user turn as that separate
+      stable block instead of gluing it into the instruction string.
+- [x] Anthropic: emits the doc as its own `{type:text, cache_control:{type:ephemeral}}` block, guarded by
+      `cacheMinChars = 8000` (~Haiku's 2048-token cache minimum; below it the mark is a no-op).
+- [x] OpenAI/Gemini: unchanged code — they auto-cache a stable leading prefix; `flattenedContent` keeps the
+      first turn byte-identical across follow-ups so the prefix hits. Groq/Ollama: flatten only (no caching).
+- [x] Hosted: folds doc via `flattenedContent` so the Worker still gets a stable cacheable prefix.
+- Note: single-shot drops don't benefit (first turn pays ~25% cache-write premium, recovered on 1st follow-up).
+
+---
+
+## Feature — Per-action output ceilings / routing policy (DONE — build green)
+
+> Plan + impl 2026-05-31. From `docs/HOW_LLM_IS_CHOSEN.md` (rewritten as an engineering spec).
+> Owner priority: **minimise the operator's API bill first**; per-user caps are a relief valve.
+> `max_tokens` is a CEILING not a target (you pay for tokens emitted), so this is a RUNAWAY
+> GUARD, not the primary saving — the big levers (Worker model routing, prompt caching) come later.
+
+- [x] New `AI/ModelRouting.swift`: `AITier{fast,strong}`, `AITaskClass`, `RoutingPlan{tier,
+      taskClass,maxOutputTokens}`, `AIAction.routing` (static per-action plan), and
+      `RoutingPlan.forCustomPrompt(_:)` (deterministic keyword/length heuristic, prompt text only,
+      escalates typed prompts to `.strong` on evaluation/judgement signals).
+- [x] Ceilings: tight for bounded output (summariseShort/altText 120; extract*/bullets 512),
+      generous ~4096 where output ≈ input (translate*/rephrase*/addDocstring, OCR), mid for
+      explain/findBugs/refactor 1024, freeform 1536, evaluation 2048.
+- [x] `AIProvider.reply` → `reply(messages:imageURL:maxOutputTokens:)`; all 6 providers replace the
+      hardcoded `4096`. Gemini keeps thinking headroom: `max(maxOutputTokens + 1024, 2048)` +
+      `reasoning_effort: low`. Hosted forwards `max_tokens` so the Worker can cap the host model.
+- [x] `sendTurn` computes the plan (`forCustomPrompt` for typed prompts, else `action.routing`) and
+      passes `plan.maxOutputTokens`.
+- [x] Fixed extension/app version mismatch warning (AddToAIDrop MARKETING_VERSION 1.0 → 0.9.8).
+- [ ] NOT done (future, by ROI): Worker model routing (biggest lever, needs Worker live), prompt
+      caching of the document prefix, image-only input trimming, validated escalation for extraction,
+      usage instrumentation in normalised cost-credits.
+
+---
+
+## Feature — Conversation redesign + Gemini cutoff fix (v0.9.9, DONE — build green, manual test pending)
+
+> Plan 2026-05-31. Make the result window a real multi-turn chat instead of a single result
+> that restarts on every follow-up. Plus fix Gemini 2.5 Flash replies being cut off.
+> Design confirmed: Restart (↻) = clear chat, keep file (→ suggested actions). User prompts =
+> right-aligned bubbles; AI = full-width Markdown.
+
+**Root causes**
+- No conversation state: every chip/prompt calls `provider.complete(action:content:imageURL:)`,
+  which rebuilds `[system, user(file)]` and REPLACES the single `.result(text)`. Hence "restart"
+  + file re-sent + no transcript.
+- Gemini cutoff: `GeminiProvider` `max_tokens: 1024`. 2.5-Flash thinking tokens eat that budget via
+  the OpenAI-compat endpoint → `finish_reason: length` (the trailing bare `*`). Not parsing, not
+  input context (1M).
+
+**Plan**
+- [x] Model: added `ChatRole`, `ChatMessage { role, display, modelText }`, `BaseContext`. VM gets
+      `@Published conversation`, `@Published isAwaitingReply`, `var baseContext` (extracted once;
+      invalidated by `additionalFileURLs.didSet`). `restartConversation(url:)` clears it → chips.
+- [x] Clear `conversation` + `baseContext` + `isAwaitingReply` in `setChips`, `restartConversation`,
+      `reset()`. `MinimizedSnapshot` carries `conversation` + `baseContext`; minimize gated on
+      `!isAwaitingReply`; `applySnapshot` restores baseContext AFTER additionalFileURLs (didSet order).
+- [x] Provider protocol: replaced `complete(...)` with `reply(messages: [ChatTurn], imageURL:)`.
+      All 6 providers updated. Shared `openAICompatMessages(_:imageURL:attachImage:)` inlines the image
+      into the first user turn (Groq/Ollama text-only → attachImage:false; OpenAI/Gemini true).
+      Anthropic/Hosted split system turns into their own field.
+- [x] Token fix: `max_tokens` 4096 across providers; Gemini also `reasoning_effort: "low"`.
+- [x] Orchestrator: file-scope `sendTurn(provider:fileURL:action:typedPrompt:)` + `buildChatTurns` +
+      `applyStage` in OverlayView. Optimistic user bubble; first/back-nav turn → `.loading`→`.result`,
+      in-result follow-ups stay `.result` + inline `isAwaitingReply` thinking row. Error keeps the
+      transcript (assistant ⚠️ note) unless it's the first turn (→ `.error`).
+- [x] Rewired all 4 run sites (ChipsColumnView + TwoColumnView, action + custom) to `sendTurn`;
+      removed both per-view `setStage` helpers.
+- [x] UI: transcript ScrollViewReader (ForEach conversation → `ChatBubble`: right capsule for `.user`,
+      full-width `MarkdownText` for `.assistant`) + `ThinkingRow` + auto-scroll to bottom.
+- [x] Buttons: ↻ → `restartConversation` ("New conversation"). ← back unchanged (no convo clear).
+- [x] History reopen rebuilds the full transcript from `SessionRecord.turns` (user+assistant per turn).
+- [x] Resize: `.result` height from whole-transcript length, clamped 380–600.
+- [ ] Manual test: multi-turn append (no restart), Gemini full replies, ↻ clears + keeps file,
+      reopen-from-history shows transcript, minimize/restore mid-conversation.
+
+---
+
+## Feature — Multi-file drop + Finder "Add to AI Drop" Quick Action (v0.9.10, IN PROGRESS)
+
+> Plan 2026-05-31. Two asks: (1) dragging MULTIPLE files drops them ALL into one session;
+> (2) a Finder right-click "Add to AI Drop" that pops Stage 2 with the selected file(s).
+> Decisions: right-click = a real Finder **Quick Action** (separate Action Extension target,
+> top-level menu item). Files dropped/added onto an ALREADY-OPEN session keep the existing
+> add/replace prompt, made batch-aware ("Add N files").
+
+### Part 1 — Multi-file drop (self-contained, no new target) — ✅ DONE (build green, manual test pending)
+- [x] `DroppableHostingView`: `extractURLs(from:)` (plural) + `cachedDropURLs: [URL]`; register reads all.
+- [x] VM: migrate `pendingSecondFileURL: URL?` → `@Published pendingDroppedURLs: [URL]`; update all
+      read sites (`isEmpty`) + write sites (`[]`). Add `setChips(urls: [URL])` — first supported = primary,
+      rest supported = additionals; route unsupported-only to `.error`.
+- [x] `performDragOperation`: fresh drop of N files → `setChips(urls:)`; active session → set
+      `pendingDroppedURLs` (filtered to supported) for the banner.
+- [x] `SecondFilePromptBanner`: batch-aware (header "N files", "Add N files to session"); `addToSession`
+      appends all; `startNewSession` → `setChips(urls:)` with all.
+- [ ] Manual test: drag 3 files → one session w/ 3 pills; drop 2 onto open session → "Add 2 files".
+
+### Part 2 — Finder Quick Action extension (NEW TARGET — created in Xcode ✅)
+> A macOS Action Extension (No-UI) that is a Finder Quick Action. SEPARATE, sandboxed process,
+> so it hands the selected file URLs to the (non-sandboxed, always-on) main app.
+> **IPC pivot (2026-05-31):** dropped the App Group plan — App Groups need dev-portal registration that
+> a free/personal team can't do, which would dead-end the feature. Instead use a **named NSPasteboard**
+> (`com.wallbrecher.MacNotchAI.share`) for the payload + a **Darwin notification** ping
+> (`com.wallbrecher.MacNotchAI.addFiles`). Needs ZERO capabilities — works on any signing tier.
+- [x] Extension target **AddToAIDrop** created in Xcode (No-UI Action Extension, embedded in MacNotchAI).
+      Files in `AddToAIDrop/`: `ActionRequestHandler.swift` (reads `inputItems` → file URLs → writes the
+      named pasteboard → posts Darwin ping → `completeRequest`; `ShareHandoff` writer inlined so the
+      target needs only this ONE source file), `Info.plist` (NSExtension `com.apple.services`, principal
+      class `$(PRODUCT_MODULE_NAME).ActionRequestHandler`, role Editor, Finder preview keys, activation
+      rule `NSExtensionActivationSupportsFileWithMaxCount=100`). Sandbox + user-selected read-only come
+      from build settings `ENABLE_APP_SANDBOX=YES` / `ENABLE_USER_SELECTED_FILES=readonly` (no physical
+      entitlements file needed — the prepared `.entitlements` was deleted as redundant). Menu title set
+      via `INFOPLIST_KEY_CFBundleDisplayName = "Add to AI Drop"`.
+- [x] Main app side: `MacNotchAI/IPC/ShareInbox.swift` (`drain()` reads the named pasteboard);
+      `AppDelegate.registerShareInboxObserver` (Darwin observer → posts `.addFilesFromShare`);
+      `handleAddFilesFromShare` (drains + opens); `AppDelegate.openSessionWithFiles(_:)` (cancel dismiss →
+      build/reuse window → `vm.setChips(urls:)` → size/place/order-front → `NSApp.activate`). Reuses the
+      `restoreMinimizedSession` window bring-up pattern.
+- [x] Full build green (main app + AddToAIDrop.appex compile, embed, codesign).
+- [ ] **Manual test:** run the app once (registers the extension with LaunchServices/pluginkit), then
+      right-click file(s) in Finder ▸ **Quick Actions** (or the menu directly) ▸ **Add to AI Drop** → Stage 2
+      pops with the selected file(s). If it doesn't appear: System Settings ▸ Login Items & Extensions ▸
+      enable it under Finder/Quick Actions; `pkill Finder` (or re-login) refreshes the menu.
+
+---
+
 ## ✅ Decision 0 — SETTLED: Path A (Developer ID + notarization)
 
 **Chosen 2026-05-29: Path A.** Distribute as a notarized, signed direct download (NOT the Mac App

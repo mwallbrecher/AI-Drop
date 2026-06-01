@@ -80,6 +80,40 @@ class OverlayViewModel: ObservableObject {
         }
     }
 
+    // MARK: - Conversation (multi-turn chat transcript)
+    //
+    // The result stage is a real chat transcript, not a single answer. Every chip /
+    // typed prompt appends a turn instead of replacing the result, so follow-ups keep
+    // the same document context. Only restartConversation() clears it.
+
+    enum ChatRole { case user, assistant }
+
+    /// One rendered transcript line. `display` is what the UI shows (the user's prompt
+    /// title, or the assistant's Markdown answer); `modelText` is what is sent to the
+    /// model for that turn (the action's system prompt, or the assistant's answer).
+    struct ChatMessage: Identifiable, Hashable {
+        let id = UUID()
+        let role: ChatRole
+        let display: String
+        let modelText: String
+    }
+
+    /// The extracted document context, built once per session and reused for every
+    /// turn so the file is never re-read / re-extracted. Cleared when the file set
+    /// changes (didSet on additionalFileURLs) or on restart.
+    struct BaseContext {
+        let content: String
+        let imageURL: URL?
+        let truncated: Bool
+    }
+
+    @Published var conversation: [ChatMessage] = []
+    /// True while a follow-up turn is in flight (transcript already on screen). Drives
+    /// the "Thinking…" row. The FIRST turn uses the .loading stage instead.
+    @Published var isAwaitingReply = false
+    /// Cached extracted document context for the current session (see BaseContext).
+    var baseContext: BaseContext? = nil
+
     @Published var stage: Stage = .waitingForDrop
     // Active tab in the stage-2 prompt section. Reset to .suggested on each fresh
     // drop so a new file always opens on its suggested actions.
@@ -120,6 +154,8 @@ class OverlayViewModel: ObservableObject {
         var additionalFileURLs: [URL]
         var contentTruncated: Bool
         var customPrompt: String
+        var conversation: [ChatMessage]
+        var baseContext: BaseContext?
     }
 
     /// True while a minimized session is waiting to be restored. Drives the menu-bar
@@ -133,15 +169,18 @@ class OverlayViewModel: ObservableObject {
         NSWorkspace.shared.accessibilityDisplayShouldReduceMotion
     }
 
-    /// URL of a second file dropped while an active session is running.
-    /// Shown as a banner prompt: "Add to session" or "New session".
-    /// Cleared when the user picks an option or dismisses.
-    @Published var pendingSecondFileURL: URL? = nil
+    /// File(s) dropped while an active session is running. Shown as a batch-aware
+    /// banner prompt: "Add N file(s) to session" or "New session". Cleared when the
+    /// user picks an option or dismisses. (Supersedes the old single `pendingSecondFileURL`.)
+    @Published var pendingDroppedURLs: [URL] = []
 
     /// Files added to the current session via "Add to session".
     /// Their content is concatenated with the primary file's content in AI calls.
-    /// Cleared on reset() and setChips() (fresh session).
-    @Published var additionalFileURLs: [URL] = []
+    /// Cleared on reset() and setChips() (fresh session). Changing the file set
+    /// invalidates the cached BaseContext so the next turn re-extracts.
+    @Published var additionalFileURLs: [URL] = [] {
+        didSet { baseContext = nil }
+    }
 
     // ── Jelly wobble ─────────────────────────────────────────────────────────
     // Applied to the pill scaleEffect in OverlayView (outside clipShape so it
@@ -200,10 +239,64 @@ class OverlayViewModel: ObservableObject {
         // Fresh drop re-anchors the window at the notch; discard any manual nudge.
         userDragOffset = .zero
         contentTruncated = false
+        // Fresh drop = a brand-new conversation.
+        conversation = []
+        baseContext = nil
+        isAwaitingReply = false
         // Fresh drop = a new history session (record persisted on the first turn).
         SessionHistoryStore.shared.beginSession(primary: url)
         stage = .chips(url: url, actions: FileInspector.suggestedActions(for: url))
         customPrompt = ""
+    }
+
+    /// Open Stage 2 for a batch of dropped files in ONE session: the first supported
+    /// file is the primary, the rest become additional session files. Unsupported
+    /// files are skipped; if NONE are supported the stage routes to `.error`. Used by
+    /// multi-file drag-drop and the Finder "Add to AI Drop" Quick Action.
+    func setChips(urls: [URL]) {
+        let supported = urls.filter { !FileInspector.isUnsupportedFileType($0) }
+        guard let primary = supported.first else {
+            // Nothing analysable in the batch.
+            let name = urls.first?.lastPathComponent ?? "These files"
+            minimizedSnapshot = nil
+            hasMinimizedSession = false
+            stage = .error(
+                url: urls.first ?? URL(fileURLWithPath: "/"),
+                message: "\"\(name)\" can't be analysed.\nAI Drop supports PDF, text, images, and code files.")
+            return
+        }
+        let extras = Array(supported.dropFirst())
+
+        minimizedSnapshot = nil
+        hasMinimizedSession = false
+        chipsTab = .suggested
+        cachedResult = nil
+        userDragOffset = .zero
+        contentTruncated = false
+        conversation = []
+        baseContext = nil
+        isAwaitingReply = false
+        // Set additionals BEFORE the stage so chip actions reflect the whole batch.
+        additionalFileURLs = extras
+        SessionHistoryStore.shared.beginSession(primary: primary)
+        stage = .chips(url: primary,
+                       actions: FileInspector.suggestedActions(forAll: [primary] + extras))
+        customPrompt = ""
+    }
+
+    /// Restart (↻) scope: "clear chat, keep file". Wipes the transcript and cached
+    /// context but keeps the same document(s) and returns to the suggested actions —
+    /// a fresh conversation on the same file without re-dropping it.
+    func restartConversation(url: URL) {
+        conversation = []
+        baseContext = nil
+        isAwaitingReply = false
+        cachedResult = nil
+        contentTruncated = false
+        customPrompt = ""
+        chipsTab = .suggested
+        stage = .chips(url: url,
+                       actions: FileInspector.suggestedActions(forAll: [url] + additionalFileURLs))
     }
 
     /// Navigate back to the chips stage while keeping the current result cached
@@ -219,13 +312,15 @@ class OverlayViewModel: ObservableObject {
     /// Capture the current session so it can be restored later. Returns false (no-op)
     /// at `waitingForDrop` — there is no session to minimize.
     func minimizeCurrentSession() -> Bool {
-        guard stage.tag != 0 else { return false }
+        // No session at waitingForDrop; never park a turn that is still in flight
+        // (the async reply would land into a torn-down session).
+        guard stage.tag != 0, !isAwaitingReply else { return false }
         minimizedSnapshot = MinimizedSnapshot(
             stage: stage, chipsTab: chipsTab,
             isChipsExpanded: isChipsExpanded, isFollowupsExpanded: isFollowupsExpanded,
             userDragOffset: userDragOffset, cachedResult: cachedResult,
             additionalFileURLs: additionalFileURLs, contentTruncated: contentTruncated,
-            customPrompt: customPrompt)
+            customPrompt: customPrompt, conversation: conversation, baseContext: baseContext)
         hasMinimizedSession = true
         return true
     }
@@ -251,9 +346,12 @@ class OverlayViewModel: ObservableObject {
         chipsTab            = s.chipsTab
         userDragOffset      = s.userDragOffset
         cachedResult        = s.cachedResult
-        additionalFileURLs  = s.additionalFileURLs
+        additionalFileURLs  = s.additionalFileURLs   // didSet clears baseContext…
         contentTruncated    = s.contentTruncated
         customPrompt        = s.customPrompt
+        conversation        = s.conversation
+        isAwaitingReply     = false
+        baseContext         = s.baseContext          // …so restore it AFTER the line above
         stage               = s.stage
     }
 
@@ -315,7 +413,7 @@ class OverlayViewModel: ObservableObject {
         isDragHovering      = false
         isDraggingOut       = false
         handoffProviderName = nil
-        pendingSecondFileURL = nil
+        pendingDroppedURLs  = []
         jellyX              = 1.0
         jellyY              = 1.0
     }
@@ -332,10 +430,13 @@ class OverlayViewModel: ObservableObject {
         customPrompt   = ""
         cachedResult        = nil
         handoffProviderName = nil
-        pendingSecondFileURL  = nil
+        pendingDroppedURLs    = []
         additionalFileURLs    = []
         userDragOffset        = .zero
         contentTruncated      = false
+        conversation          = []
+        baseContext           = nil
+        isAwaitingReply       = false
         jellyX              = 1.0
         jellyY         = 1.0
         isCollapsing   = false

@@ -66,6 +66,13 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             name: .showCustomDisable, object: nil
         )
 
+        // Finder "Add to AI Drop" Quick Action → opens Stage 2 with the selected files.
+        NotificationCenter.default.addObserver(
+            self, selector: #selector(handleAddFilesFromShare),
+            name: .addFilesFromShare, object: nil
+        )
+        registerShareInboxObserver()
+
         // Space switches cancel any active system drag and leave DragMonitor in a
         // stale state — pressTimeChangeCount and lastDragChangeCount diverge, making
         // the next drag on the new space fail the pasteboard guard silently.
@@ -103,6 +110,63 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     @objc private func handleMinimizeOverlay()   { minimizeOverlay()   }
     @objc private func handleShowHotkeyPicker()  { showHotkeyPicker()  }
     @objc private func handleShowCustomDisable() { showCustomDisable() }
+
+    // MARK: - Finder "Add to AI Drop" Quick Action
+
+    /// Subscribe to the Darwin notification the (sandboxed) extension posts after it
+    /// writes the selected paths into the shared App Group inbox. Darwin notifications
+    /// are the one IPC channel that crosses the sandbox boundary. The C callback can't
+    /// capture, so it just re-posts a normal Notification the @MainActor handler observes.
+    private func registerShareInboxObserver() {
+        CFNotificationCenterAddObserver(
+            CFNotificationCenterGetDarwinNotifyCenter(),
+            nil,
+            { _, _, _, _, _ in
+                NotificationCenter.default.post(name: .addFilesFromShare, object: nil)
+            },
+            ShareInbox.darwinNotification as CFString,
+            nil,
+            .deliverImmediately
+        )
+    }
+
+    @objc private func handleAddFilesFromShare() {
+        // The Darwin callback may fire off the main thread — bounce onto the main actor.
+        Task { @MainActor in
+            let urls = ShareInbox.drain()
+            guard !urls.isEmpty else { return }
+            self.openSessionWithFiles(urls)
+        }
+    }
+
+    /// Open Stage 2 (chips) for files handed over by the Finder Quick Action. Mirrors
+    /// restoreMinimizedSession()'s window bring-up: cancel any pending dismiss, reuse or
+    /// build the overlay window, populate the session, size/place, and bring forward.
+    @MainActor
+    func openSessionWithFiles(_ urls: [URL]) {
+        let supported = urls.filter { !FileInspector.isUnsupportedFileType($0) }
+        guard !supported.isEmpty else { return }
+
+        // Cancel any pending dismiss so a fading window isn't torn down under us.
+        dismissToken       = UUID()
+        isWindowDismissing = false
+
+        if overlayWindow == nil {
+            let window = OverlayWindow()
+            window.contentView = DroppableHostingView(
+                rootView: OverlayView(provider: resolveProvider())
+            )
+            overlayWindow = window
+        }
+
+        OverlayViewModel.shared.setChips(urls: supported)
+        let (size, anchorLeft) = sizeForStage(OverlayViewModel.shared.stage)
+        overlayWindow?.alphaValue = 1
+        overlayWindow?.place(size: size, anchorAtNotchCenter: anchorLeft)
+        overlayWindow?.orderFront(nil)
+        NSApp.activate(ignoringOtherApps: true)
+        startDismissMonitors()
+    }
 
     /// Called by macOS whenever the user switches Mission Control spaces.
     /// Resets DragMonitor so stale pasteboard change-counts from the previous
@@ -404,6 +468,18 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             .map { URL(fileURLWithPath: $0) }
             .filter { FileManager.default.fileExists(atPath: $0.path) }
 
+        // Rebuild the full chat transcript from the stored turns: each turn becomes a
+        // user bubble (its prompt) + an assistant bubble (its result). baseContext is
+        // left nil so the first follow-up re-extracts the file once.
+        let conversation: [OverlayViewModel.ChatMessage] = rec.turns.flatMap { turn -> [OverlayViewModel.ChatMessage] in
+            let action = AIAction(rawValue: turn.actionRaw) ?? .freeform
+            let userModelText = (action == .freeform) ? turn.promptTitle : action.systemPrompt
+            return [
+                .init(role: .user, display: turn.promptTitle, modelText: userModelText),
+                .init(role: .assistant, display: turn.resultText, modelText: turn.resultText),
+            ]
+        }
+
         let vm = OverlayViewModel.shared
         let snap = OverlayViewModel.MinimizedSnapshot(
             stage: stage,
@@ -414,7 +490,9 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             cachedResult: cached,
             additionalFileURLs: additional,
             contentTruncated: false,
-            customPrompt: "")
+            customPrompt: "",
+            conversation: conversation,
+            baseContext: nil)
         vm.stageMinimized(snap)
         restoreMinimizedSession()
         // Continue this record so further actions append rather than duplicate.
@@ -896,13 +974,16 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         case .loading:
             return (CGSize(width: 500 * s, height: 280 * s), true)
 
-        case .result(_, _, let text):
-            // Window is always sized to fit the full expanded layout (result card +
+        case .result:
+            // Window is always sized to fit the full expanded layout (transcript card +
             // prompt + follow-up chips). The follow-up toggle only controls content
             // visibility inside the window — the ScrollView grows into the freed space
-            // without the window frame changing at all.
-            let lines = max(text.components(separatedBy: "\n").count, text.count / 55)
-            let resultH = min(CGFloat(lines) * 20, 200)
+            // without the window frame changing at all. Height grows with the whole
+            // transcript (all turns), clamped 380…600; the card scrolls beyond that.
+            let convo = OverlayViewModel.shared.conversation
+            let totalChars = convo.reduce(0) { $0 + $1.display.count }
+            let lines = max(convo.count * 2, totalChars / 55)
+            let resultH = min(CGFloat(lines) * 20, 260)
             let h = (18 + 44 + resultH + 44 + 20 + 3 * 40 + 44 + 18) * s
             return (CGSize(width: 500 * s, height: min(max(h, 380 * s), 600 * s)), true)
 
@@ -1041,6 +1122,7 @@ extension Notification.Name {
     static let minimizeOverlay  = Notification.Name("com.aidrop.minimizeOverlay")
     static let showHotkeyPicker = Notification.Name("com.aidrop.showHotkeyPicker")
     static let showCustomDisable = Notification.Name("com.aidrop.showCustomDisable")
+    static let addFilesFromShare = Notification.Name("com.aidrop.addFilesFromShare")
 }
 
 // MARK: - Provider resolution

@@ -124,7 +124,7 @@ The built-in **free tier** runs through a hosted metering proxy — the host key
 
 ## Requirements
 
-- **macOS 13 Ventura** or later (macOS 14 Sonoma recommended)
+- **macOS 14 Sonoma** or later
 - A Mac with a **notch** (MacBook Pro 14″ / 16″, MacBook Air M2+) — works on non-notch Macs too, pill appears at the top-center of the screen
 - **Xcode 15** or later to build from source
 - **Accessibility permission** — required for global drag detection (`NSEvent.addGlobalMonitorForEvents`)

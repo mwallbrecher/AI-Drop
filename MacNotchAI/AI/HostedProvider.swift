@@ -31,7 +31,7 @@ final class HostedProvider: AIProvider {
     /// Only usable once the Worker URL has been configured.
     var isAvailable: Bool { BackendConfig.proxyBaseURL != nil }
 
-    func complete(action: AIAction, content: String, imageURL: URL?) async throws -> String {
+    func reply(messages turns: [ChatTurn], imageURL: URL?, plan: RoutingPlan) async throws -> String {
         guard let base = BackendConfig.proxyBaseURL else { throw HostedError.backendNotConfigured }
 
         var request = URLRequest(url: base.appendingPathComponent("v1/complete"))
@@ -39,10 +39,23 @@ final class HostedProvider: AIProvider {
         request.setValue("application/json", forHTTPHeaderField: "Content-Type")
         request.setValue(DeviceIdentity.current, forHTTPHeaderField: "X-Device-Id")
 
+        // Send the whole conversation: system prompt separate, user/assistant
+        // turns as a messages array. The Worker forwards to the host model.
+        // Fold the document back into the first user turn (flattenedContent) so the
+        // Worker still receives a stable leading prefix it can cache server-side.
+        let system = turns.filter { $0.role == "system" }.map(\.content).joined(separator: "\n\n")
+        let messages = turns.filter { $0.role != "system" }
+            .map { ["role": $0.role, "content": $0.flattenedContent] }
+
+        // Forward the routing decision so the Worker can pick the model (`tier`) and cap
+        // the output (`max_tokens`). The Worker owns the key — this is where the operator's
+        // bill is actually won. `tier` is a hint: the Worker falls back to the capable
+        // model if it's missing or unrecognised.
         var body: [String: Any] = [
-            "action": action.rawValue,
-            "system": action.systemPrompt,
-            "content": content,
+            "system": system,
+            "messages": messages,
+            "max_tokens": plan.maxOutputTokens,
+            "tier": plan.tier.rawValue,
         ]
         if let imageURL, FileInspector.isImageFile(imageURL),
            let imageData = try? Data(contentsOf: imageURL) {

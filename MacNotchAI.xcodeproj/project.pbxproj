@@ -6,14 +6,63 @@
 	objectVersion = 77;
 	objects = {
 
+/* Begin PBXBuildFile section */
+		59D7920B2FCCD1D000A261BB /* Cocoa.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = 59D7920A2FCCD1CF00A261BB /* Cocoa.framework */; };
+		59D792162FCCD1D000A261BB /* AddToAIDrop.appex in Embed Foundation Extensions */ = {isa = PBXBuildFile; fileRef = 59D792082FCCD1CF00A261BB /* AddToAIDrop.appex */; settings = {ATTRIBUTES = (RemoveHeadersOnCopy, ); }; };
+/* End PBXBuildFile section */
+
+/* Begin PBXContainerItemProxy section */
+		59D792142FCCD1D000A261BB /* PBXContainerItemProxy */ = {
+			isa = PBXContainerItemProxy;
+			containerPortal = 59114F552F699A5100E47DD9 /* Project object */;
+			proxyType = 1;
+			remoteGlobalIDString = 59D792072FCCD1CF00A261BB;
+			remoteInfo = AddToAIDrop;
+		};
+/* End PBXContainerItemProxy section */
+
+/* Begin PBXCopyFilesBuildPhase section */
+		59D792172FCCD1D000A261BB /* Embed Foundation Extensions */ = {
+			isa = PBXCopyFilesBuildPhase;
+			buildActionMask = 2147483647;
+			dstPath = "";
+			dstSubfolderSpec = 13;
+			files = (
+				59D792162FCCD1D000A261BB /* AddToAIDrop.appex in Embed Foundation Extensions */,
+			);
+			name = "Embed Foundation Extensions";
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+/* End PBXCopyFilesBuildPhase section */
+
 /* Begin PBXFileReference section */
 		59114F5D2F699A5100E47DD9 /* MacNotchAI.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = MacNotchAI.app; sourceTree = BUILT_PRODUCTS_DIR; };
+		59D792082FCCD1CF00A261BB /* AddToAIDrop.appex */ = {isa = PBXFileReference; explicitFileType = "wrapper.app-extension"; includeInIndex = 0; path = AddToAIDrop.appex; sourceTree = BUILT_PRODUCTS_DIR; };
+		59D7920A2FCCD1CF00A261BB /* Cocoa.framework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.framework; name = Cocoa.framework; path = System/Library/Frameworks/Cocoa.framework; sourceTree = SDKROOT; };
 /* End PBXFileReference section */
+
+/* Begin PBXFileSystemSynchronizedBuildFileExceptionSet section */
+		59D7921A2FCCD1D000A261BB /* Exceptions for "AddToAIDrop" folder in "AddToAIDrop" target */ = {
+			isa = PBXFileSystemSynchronizedBuildFileExceptionSet;
+			membershipExceptions = (
+				Info.plist,
+			);
+			target = 59D792072FCCD1CF00A261BB /* AddToAIDrop */;
+		};
+/* End PBXFileSystemSynchronizedBuildFileExceptionSet section */
 
 /* Begin PBXFileSystemSynchronizedRootGroup section */
 		59114F5F2F699A5100E47DD9 /* MacNotchAI */ = {
 			isa = PBXFileSystemSynchronizedRootGroup;
 			path = MacNotchAI;
+			sourceTree = "<group>";
+		};
+		59D7920C2FCCD1D000A261BB /* AddToAIDrop */ = {
+			isa = PBXFileSystemSynchronizedRootGroup;
+			exceptions = (
+				59D7921A2FCCD1D000A261BB /* Exceptions for "AddToAIDrop" folder in "AddToAIDrop" target */,
+			);
+			path = AddToAIDrop;
 			sourceTree = "<group>";
 		};
 /* End PBXFileSystemSynchronizedRootGroup section */
@@ -26,6 +75,14 @@
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
+		59D792052FCCD1CF00A261BB /* Frameworks */ = {
+			isa = PBXFrameworksBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+				59D7920B2FCCD1D000A261BB /* Cocoa.framework in Frameworks */,
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
 /* End PBXFrameworksBuildPhase section */
 
 /* Begin PBXGroup section */
@@ -33,6 +90,8 @@
 			isa = PBXGroup;
 			children = (
 				59114F5F2F699A5100E47DD9 /* MacNotchAI */,
+				59D7920C2FCCD1D000A261BB /* AddToAIDrop */,
+				59D792092FCCD1CF00A261BB /* Frameworks */,
 				59114F5E2F699A5100E47DD9 /* Products */,
 			);
 			sourceTree = "<group>";
@@ -41,8 +100,17 @@
 			isa = PBXGroup;
 			children = (
 				59114F5D2F699A5100E47DD9 /* MacNotchAI.app */,
+				59D792082FCCD1CF00A261BB /* AddToAIDrop.appex */,
 			);
 			name = Products;
+			sourceTree = "<group>";
+		};
+		59D792092FCCD1CF00A261BB /* Frameworks */ = {
+			isa = PBXGroup;
+			children = (
+				59D7920A2FCCD1CF00A261BB /* Cocoa.framework */,
+			);
+			name = Frameworks;
 			sourceTree = "<group>";
 		};
 /* End PBXGroup section */
@@ -55,10 +123,12 @@
 				59114F592F699A5100E47DD9 /* Sources */,
 				59114F5A2F699A5100E47DD9 /* Frameworks */,
 				59114F5B2F699A5100E47DD9 /* Resources */,
+				59D792172FCCD1D000A261BB /* Embed Foundation Extensions */,
 			);
 			buildRules = (
 			);
 			dependencies = (
+				59D792152FCCD1D000A261BB /* PBXTargetDependency */,
 			);
 			fileSystemSynchronizedGroups = (
 				59114F5F2F699A5100E47DD9 /* MacNotchAI */,
@@ -69,6 +139,28 @@
 			productName = MacNotchAI;
 			productReference = 59114F5D2F699A5100E47DD9 /* MacNotchAI.app */;
 			productType = "com.apple.product-type.application";
+		};
+		59D792072FCCD1CF00A261BB /* AddToAIDrop */ = {
+			isa = PBXNativeTarget;
+			buildConfigurationList = 59D7921B2FCCD1D000A261BB /* Build configuration list for PBXNativeTarget "AddToAIDrop" */;
+			buildPhases = (
+				59D792042FCCD1CF00A261BB /* Sources */,
+				59D792052FCCD1CF00A261BB /* Frameworks */,
+				59D792062FCCD1CF00A261BB /* Resources */,
+			);
+			buildRules = (
+			);
+			dependencies = (
+			);
+			fileSystemSynchronizedGroups = (
+				59D7920C2FCCD1D000A261BB /* AddToAIDrop */,
+			);
+			name = AddToAIDrop;
+			packageProductDependencies = (
+			);
+			productName = AddToAIDrop;
+			productReference = 59D792082FCCD1CF00A261BB /* AddToAIDrop.appex */;
+			productType = "com.apple.product-type.app-extension";
 		};
 /* End PBXNativeTarget section */
 
@@ -81,6 +173,9 @@
 				LastUpgradeCheck = 2600;
 				TargetAttributes = {
 					59114F5C2F699A5100E47DD9 = {
+						CreatedOnToolsVersion = 26.0.1;
+					};
+					59D792072FCCD1CF00A261BB = {
 						CreatedOnToolsVersion = 26.0.1;
 					};
 				};
@@ -100,12 +195,20 @@
 			projectRoot = "";
 			targets = (
 				59114F5C2F699A5100E47DD9 /* MacNotchAI */,
+				59D792072FCCD1CF00A261BB /* AddToAIDrop */,
 			);
 		};
 /* End PBXProject section */
 
 /* Begin PBXResourcesBuildPhase section */
 		59114F5B2F699A5100E47DD9 /* Resources */ = {
+			isa = PBXResourcesBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+		59D792062FCCD1CF00A261BB /* Resources */ = {
 			isa = PBXResourcesBuildPhase;
 			buildActionMask = 2147483647;
 			files = (
@@ -122,7 +225,22 @@
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
+		59D792042FCCD1CF00A261BB /* Sources */ = {
+			isa = PBXSourcesBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
 /* End PBXSourcesBuildPhase section */
+
+/* Begin PBXTargetDependency section */
+		59D792152FCCD1D000A261BB /* PBXTargetDependency */ = {
+			isa = PBXTargetDependency;
+			target = 59D792072FCCD1CF00A261BB /* AddToAIDrop */;
+			targetProxy = 59D792142FCCD1D000A261BB /* PBXContainerItemProxy */;
+		};
+/* End PBXTargetDependency section */
 
 /* Begin XCBuildConfiguration section */
 		59114F662F699A5300E47DD9 /* Debug */ = {
@@ -179,7 +297,7 @@
 				GCC_WARN_UNUSED_FUNCTION = YES;
 				GCC_WARN_UNUSED_VARIABLE = YES;
 				LOCALIZATION_PREFERS_STRING_CATALOGS = YES;
-				MACOSX_DEPLOYMENT_TARGET = 26.0;
+				MACOSX_DEPLOYMENT_TARGET = 14.0;
 				MTL_ENABLE_DEBUG_INFO = INCLUDE_SOURCE;
 				MTL_FAST_MATH = YES;
 				ONLY_ACTIVE_ARCH = YES;
@@ -237,7 +355,7 @@
 				GCC_WARN_UNUSED_FUNCTION = YES;
 				GCC_WARN_UNUSED_VARIABLE = YES;
 				LOCALIZATION_PREFERS_STRING_CATALOGS = YES;
-				MACOSX_DEPLOYMENT_TARGET = 26.0;
+				MACOSX_DEPLOYMENT_TARGET = 14.0;
 				MTL_ENABLE_DEBUG_INFO = NO;
 				MTL_FAST_MATH = YES;
 				SDKROOT = macosx;
@@ -315,6 +433,68 @@
 			};
 			name = Release;
 		};
+		59D792182FCCD1D000A261BB /* Debug */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				CODE_SIGN_STYLE = Automatic;
+				COMBINE_HIDPI_IMAGES = YES;
+				CURRENT_PROJECT_VERSION = 1;
+				DEVELOPMENT_TEAM = ASN2KAJ266;
+				ENABLE_APP_SANDBOX = YES;
+				ENABLE_HARDENED_RUNTIME = YES;
+				ENABLE_USER_SELECTED_FILES = readonly;
+				GENERATE_INFOPLIST_FILE = YES;
+				INFOPLIST_FILE = AddToAIDrop/Info.plist;
+				INFOPLIST_KEY_CFBundleDisplayName = "Add to AI Drop";
+				INFOPLIST_KEY_NSHumanReadableCopyright = "";
+				LD_RUNPATH_SEARCH_PATHS = (
+					"$(inherited)",
+					"@executable_path/../Frameworks",
+					"@executable_path/../../../../Frameworks",
+				);
+				MARKETING_VERSION = 0.9.8;
+				PRODUCT_BUNDLE_IDENTIFIER = com.wallbrecher.MacNotchAI.AddToAIDrop;
+				PRODUCT_NAME = "$(TARGET_NAME)";
+				SKIP_INSTALL = YES;
+				STRING_CATALOG_GENERATE_SYMBOLS = YES;
+				SWIFT_APPROACHABLE_CONCURRENCY = YES;
+				SWIFT_EMIT_LOC_STRINGS = YES;
+				SWIFT_UPCOMING_FEATURE_MEMBER_IMPORT_VISIBILITY = YES;
+				SWIFT_VERSION = 5.0;
+			};
+			name = Debug;
+		};
+		59D792192FCCD1D000A261BB /* Release */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				CODE_SIGN_STYLE = Automatic;
+				COMBINE_HIDPI_IMAGES = YES;
+				CURRENT_PROJECT_VERSION = 1;
+				DEVELOPMENT_TEAM = ASN2KAJ266;
+				ENABLE_APP_SANDBOX = YES;
+				ENABLE_HARDENED_RUNTIME = YES;
+				ENABLE_USER_SELECTED_FILES = readonly;
+				GENERATE_INFOPLIST_FILE = YES;
+				INFOPLIST_FILE = AddToAIDrop/Info.plist;
+				INFOPLIST_KEY_CFBundleDisplayName = "Add to AI Drop";
+				INFOPLIST_KEY_NSHumanReadableCopyright = "";
+				LD_RUNPATH_SEARCH_PATHS = (
+					"$(inherited)",
+					"@executable_path/../Frameworks",
+					"@executable_path/../../../../Frameworks",
+				);
+				MARKETING_VERSION = 0.9.8;
+				PRODUCT_BUNDLE_IDENTIFIER = com.wallbrecher.MacNotchAI.AddToAIDrop;
+				PRODUCT_NAME = "$(TARGET_NAME)";
+				SKIP_INSTALL = YES;
+				STRING_CATALOG_GENERATE_SYMBOLS = YES;
+				SWIFT_APPROACHABLE_CONCURRENCY = YES;
+				SWIFT_EMIT_LOC_STRINGS = YES;
+				SWIFT_UPCOMING_FEATURE_MEMBER_IMPORT_VISIBILITY = YES;
+				SWIFT_VERSION = 5.0;
+			};
+			name = Release;
+		};
 /* End XCBuildConfiguration section */
 
 /* Begin XCConfigurationList section */
@@ -332,6 +512,15 @@
 			buildConfigurations = (
 				59114F692F699A5300E47DD9 /* Debug */,
 				59114F6A2F699A5300E47DD9 /* Release */,
+			);
+			defaultConfigurationIsVisible = 0;
+			defaultConfigurationName = Release;
+		};
+		59D7921B2FCCD1D000A261BB /* Build configuration list for PBXNativeTarget "AddToAIDrop" */ = {
+			isa = XCConfigurationList;
+			buildConfigurations = (
+				59D792182FCCD1D000A261BB /* Debug */,
+				59D792192FCCD1D000A261BB /* Release */,
 			);
 			defaultConfigurationIsVisible = 0;
 			defaultConfigurationName = Release;

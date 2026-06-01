@@ -1,10 +1,76 @@
 import Foundation
 import SwiftUI
 
+/// One model-facing conversation turn. `role` is "system" | "user" | "assistant".
+/// The orchestrator (OverlayView.sendTurn) builds the full array; providers just
+/// serialise it to their wire format.
+struct ChatTurn {
+    let role: String
+    let content: String
+    /// Large, STABLE content (the extracted document) carried separately from the
+    /// turn's instruction so prompt caching can target it. It lives on the FIRST user
+    /// turn only and is byte-identical on every follow-up, so it forms a cacheable
+    /// leading prefix (doc §6). Providers with explicit caching (Anthropic) mark it
+    /// with `cache_control`; the rest fold it back into the text via `flattenedContent`,
+    /// which keeps OpenAI/Gemini *automatic* prefix caching working unchanged.
+    var cacheableDocument: String? = nil
+}
+
+extension ChatTurn {
+    /// The turn's text with the cacheable document folded in, byte-identical to the
+    /// pre-caching layout (`instruction` + the document framing). Used by every
+    /// provider WITHOUT explicit prompt caching.
+    var flattenedContent: String {
+        guard let doc = cacheableDocument, !doc.isEmpty else { return content }
+        return content + "\n\n--- Document(s) ---\n" + doc
+    }
+}
+
 protocol AIProvider {
     var name: String { get }
     var isAvailable: Bool { get }
-    func complete(action: AIAction, content: String, imageURL: URL?) async throws -> String
+    /// Multi-turn completion. `messages` is the WHOLE conversation (system turn
+    /// first); the document content lives in the first user turn. `imageURL`, when
+    /// set, is attached to the FIRST user turn for vision models. `plan` carries the
+    /// deterministic routing decision (`maxOutputTokens` runaway guard + `tier`); every
+    /// provider honours the ceiling, and the hosted Worker also uses `tier` to pick the
+    /// model. See docs/HOW_LLM_IS_CHOSEN.md §4–§5.
+    func reply(messages: [ChatTurn], imageURL: URL?, plan: RoutingPlan) async throws -> String
+}
+
+// MARK: - Shared wire-format helpers (OpenAI-compatible providers)
+
+/// MIME guess for a base64 `data:` URL.
+func aiImageMime(for url: URL) -> String {
+    switch url.pathExtension.lowercased() {
+    case "jpg", "jpeg": return "image/jpeg"
+    case "gif":         return "image/gif"
+    case "webp":        return "image/webp"
+    case "heic":        return "image/heic"
+    default:            return "image/png"
+    }
+}
+
+/// Build an OpenAI-compatible `messages` array from chat turns. When `attachImage`
+/// is true and `imageURL` is a readable image, it is inlined (base64 data URL) into
+/// the FIRST user turn. Text-only models (Groq/Ollama) pass `attachImage: false` so
+/// an image session degrades to text instead of erroring.
+func openAICompatMessages(_ turns: [ChatTurn], imageURL: URL?, attachImage: Bool) -> [[String: Any]] {
+    var imageUsed = false
+    return turns.map { turn -> [String: Any] in
+        if attachImage, turn.role == "user", !imageUsed,
+           let imageURL, FileInspector.isImageFile(imageURL),
+           let data = try? Data(contentsOf: imageURL) {
+            imageUsed = true
+            let b64 = data.base64EncodedString()
+            let mime = aiImageMime(for: imageURL)
+            return ["role": "user", "content": [
+                ["type": "image_url", "image_url": ["url": "data:\(mime);base64,\(b64)"]],
+                ["type": "text", "text": turn.flattenedContent]
+            ]]
+        }
+        return ["role": turn.role, "content": turn.flattenedContent]
+    }
 }
 
 enum AIProviderType: String, CaseIterable {

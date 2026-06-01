@@ -252,8 +252,10 @@ enum FileTool: Identifiable, Hashable {
         let ext = url.pathExtension.lowercased()
         if ext == "pdf" {
             list.append(.pdfToText)
-            let pdfCount = sessionFiles.filter { $0.pathExtension.lowercased() == "pdf" }.count
-            if pdfCount >= 2 { list.append(.stitchPDFs) }
+            // Stitch is always offered for a PDF; the menu disables it (with a hover
+            // hint) until a second PDF is in the session. Gating lives in the menu.
+            _ = sessionFiles
+            list.append(.stitchPDFs)
         }
         if FileInspector.isImageFile(url) {
             list.append(.resizeImage)

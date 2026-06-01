@@ -1,6 +1,6 @@
-# CLAUDE.md
+# AGENTS.md
 
-This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
+This file provides guidance to Codex (Codex.ai/code) when working with code in this repository.
 
 > The original "build-from-scratch" master brief was moved to `docs/ORIGINAL_BRIEF.md`.
 > It is historical — the shipping app has diverged significantly from it. Trust the code, not the brief.
@@ -28,7 +28,7 @@ open MacNotchAI.xcodeproj
   and exercising the app manually (drag a file, drop, run an action).
 - The app is **non-sandboxed** (`ENABLE_APP_SANDBOX = NO`) and requires **Accessibility permission**
   for its global `NSEvent` monitors (Escape key, outside-click). First launch prompts for it.
-- `MACOSX_DEPLOYMENT_TARGET = 14.0`, Swift 5, hardened runtime on. The mic entitlement
+- `MACOSX_DEPLOYMENT_TARGET = 26.0`, Swift 5, hardened runtime on. The mic entitlement
   (`com.apple.security.device.audio-input`) in `MacNotchAI.entitlements` is mandatory for dictation.
 - Editing `project.pbxproj` programmatically: it is **tab-indented**. String edits with spaces will
   silently fail to match (see `tasks/lessons.md` [BUILD-01]).
@@ -62,7 +62,7 @@ fixed `CGSize` per stage and calls `OverlayWindow.animateTo`. The window resizes
 `OpenAICompatibleResponse`; Anthropic has its own. `resolveProvider()` (bottom of `AppDelegate.swift`)
 reads the `selectedProvider` UserDefault and pulls the key from Keychain. `HandoffManager` is a
 separate path: it copies context to the clipboard and opens the provider's native app/web URL
-("Continue in Claude/ChatGPT").
+("Continue in Codex/ChatGPT").
 
 **Content extraction.** `FileContentExtractor` reads PDF (PDFKit, 20 pages / 12k chars) and UTF-8
 text/code; images are passed through as a URL to vision models. `FileInspector` maps extension →
@@ -126,12 +126,9 @@ These encode hard-won crash fixes. Violating them reintroduces `EXC_BREAKPOINT` 
 - README advertises **DOCX** support; `FileContentExtractor` does **not** implement it (no zip/XML
   parse) — `.docx` currently falls through to a UTF-8 read and will fail. Treat that README row as
   aspirational.
-- Deployment target is **macOS 14.0** (lowered from 26.0, 2026-06-01). The code compiles clean at 14
-  with no `@available` guards needed (the "Liquid Glass" look is custom `NSVisualEffectView`, not the
-  26-only `glassEffect` API). The **mic permission path is OS-branched** (`SpeechRecognizer`,
-  `if #available(macOS 26)`): 26 → `AVCaptureDevice`, 14/15 → `AVAudioApplication` (lessons MIC-04/05/11).
-  ⚠️ The 14/15 mic branch is **runtime-UNVERIFIED** — built from the documented lessons, but no 14/15
-  test machine was available. The macOS 26 path is unchanged and verified.
+- Deployment target is **macOS 26.0** — the app won't launch on anything older despite the README
+  saying "macOS 13+". Lowering it requires `@available` guards (some paths are macOS-26-specific, see
+  lessons MIC-05).
 - **App Store note:** the Mac App Store requires the App Sandbox, which is incompatible with this app's
   global event monitoring + Accessibility model. App Store distribution is an open architectural
   question — see `tasks/todo.md`.

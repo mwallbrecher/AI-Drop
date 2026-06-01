@@ -13,7 +13,7 @@ final class GroqProvider: AIProvider {
 
     var isAvailable: Bool { !apiKey.isEmpty }
 
-    func complete(action: AIAction, content: String, imageURL: URL?) async throws -> String {
+    func reply(messages: [ChatTurn], imageURL: URL?, plan: RoutingPlan) async throws -> String {
         guard isAvailable else { throw AIError.noAPIKey(provider: name) }
 
         var request = URLRequest(url: URL(string: baseURL)!)
@@ -21,13 +21,12 @@ final class GroqProvider: AIProvider {
         request.setValue("Bearer \(apiKey)", forHTTPHeaderField: "Authorization")
         request.setValue("application/json", forHTTPHeaderField: "Content-Type")
 
+        // llama-3.1-8b is text-only — attachImage: false so an image session
+        // degrades to text instead of erroring.
         let body: [String: Any] = [
             "model": model,
-            "messages": [
-                ["role": "system", "content": action.systemPrompt],
-                ["role": "user",   "content": content]
-            ],
-            "max_tokens": 1024,
+            "messages": openAICompatMessages(messages, imageURL: imageURL, attachImage: false),
+            "max_tokens": plan.maxOutputTokens,
             "temperature": 0.3
         ]
         request.httpBody = try JSONSerialization.data(withJSONObject: body)

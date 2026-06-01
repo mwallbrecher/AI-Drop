@@ -13,7 +13,7 @@ final class GeminiProvider: AIProvider {
     init(apiKey: String) { self.apiKey = apiKey }
     var isAvailable: Bool { !apiKey.isEmpty }
 
-    func complete(action: AIAction, content: String, imageURL: URL?) async throws -> String {
+    func reply(messages: [ChatTurn], imageURL: URL?, plan: RoutingPlan) async throws -> String {
         guard isAvailable else { throw AIError.noAPIKey(provider: name) }
 
         var request = URLRequest(url: URL(string: baseURL)!)
@@ -21,26 +21,18 @@ final class GeminiProvider: AIProvider {
         request.setValue("Bearer \(apiKey)", forHTTPHeaderField: "Authorization")
         request.setValue("application/json", forHTTPHeaderField: "Content-Type")
 
-        var userContent: Any = content
-
-        if let imageURL, FileInspector.isImageFile(imageURL),
-           let imageData = try? Data(contentsOf: imageURL) {
-            let base64 = imageData.base64EncodedString()
-            let mime = Self.mimeType(for: imageURL)
-            userContent = [
-                ["type": "image_url", "image_url": ["url": "data:\(mime);base64,\(base64)"]],
-                ["type": "text", "text": action.systemPrompt]
-            ]
-        }
-
+        // Gemini 2.5 Flash spends "thinking" tokens that count against max_tokens on
+        // Google's OpenAI-compat endpoint. A tight per-action ceiling could be eaten
+        // entirely by thinking, starving the visible answer (the 2.5-Flash cutoff —
+        // see lessons). So add reasoning headroom + a floor on top of the requested
+        // ceiling, with reasoning_effort: low to keep thinking minimal.
+        let cap = max(plan.maxOutputTokens + 1024, 2048)
         let body: [String: Any] = [
             "model": model,
-            "messages": [
-                ["role": "system", "content": action.systemPrompt],
-                ["role": "user",   "content": userContent]
-            ],
-            "max_tokens": 1024,
-            "temperature": 0.3
+            "messages": openAICompatMessages(messages, imageURL: imageURL, attachImage: true),
+            "max_tokens": cap,
+            "temperature": 0.3,
+            "reasoning_effort": "low"
         ]
         request.httpBody = try JSONSerialization.data(withJSONObject: body)
 
@@ -50,15 +42,5 @@ final class GeminiProvider: AIProvider {
         }
         let decoded = try JSONDecoder().decode(OpenAICompatibleResponse.self, from: data)
         return decoded.choices.first?.message.content ?? "No response"
-    }
-
-    private static func mimeType(for url: URL) -> String {
-        switch url.pathExtension.lowercased() {
-        case "jpg", "jpeg": return "image/jpeg"
-        case "gif":         return "image/gif"
-        case "webp":        return "image/webp"
-        case "heic":        return "image/heic"
-        default:            return "image/png"
-        }
     }
 }

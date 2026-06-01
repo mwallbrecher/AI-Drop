@@ -6,6 +6,37 @@
 
 ## macOS APIs
 
+### [IPC-01] Sandboxed extension → non-sandboxed app: named NSPasteboard + Darwin notification beats App Groups
+- **Context**: the "Add to AI Drop" Finder Quick Action is a macOS Action Extension — a SEPARATE, mandatorily-sandboxed process. It must hand the Finder file selection to the always-running, non-sandboxed main app. First plan used a shared **App Group** container file + a Darwin ping.
+- **Why App Group was wrong here**: App Groups require the group ID to be **registered on the developer portal**, which Xcode only does for a paid team via the Signing & Capabilities UI. A free/personal team can't provision App Groups, so codesign fails and the feature dead-ends. You can't tell paid vs free from the cert name ("Apple Development: …" is issued to both).
+- **Fix**: drop App Groups. Use a **named `NSPasteboard`** (`NSPasteboard(name:)`, NOT the general pasteboard) for the payload — the extension `clearContents()` + `writeObjects(urls as [NSURL])`, the main app `readObjects(forClasses:[NSURL.self], options:[.urlReadingFileURLsOnly:true])`. Pair it with a **Darwin notification** (`CFNotificationCenterGetDarwinNotifyCenter` post/observe) as the cross-sandbox "go read it now" ping (Darwin notes carry no payload, hence the pasteboard side-channel). Named pasteboards live in the system pasteboard server and are reachable from a sandbox with **zero entitlements** — works on any signing tier.
+- **Darwin callback gotcha**: the `CFNotificationCallback` is `@convention(c)` and can't capture `self`; it also may fire off the main thread. Have it just re-post a normal `Notification.Name`, and bounce to `Task { @MainActor }` in the observer before touching UI/state.
+- **Rule**: for sandboxed-extension ⇄ host-app IPC, reach for named pasteboard + Darwin notification first. Only use App Groups when you actually need a shared file container AND have a paid team.
+
+### [IPC-02] Modern Xcode extension targets get sandbox entitlements from build settings, not a .entitlements file
+- **Symptom**: created a No-UI Action Extension; expected to wire `CODE_SIGN_ENTITLEMENTS` to a prepared `.entitlements`, but the target had no `CODE_SIGN_ENTITLEMENTS` set at all — yet it still sandboxes correctly.
+- **Root cause**: recent Xcode drives entitlements from build settings — `ENABLE_APP_SANDBOX = YES` and `ENABLE_USER_SELECTED_FILES = readonly` synthesize a `DerivedSources/Entitlements.plist` at build time. A hand-authored `.entitlements` file is then **redundant** (and if pointed at via `CODE_SIGN_ENTITLEMENTS`, can fight the generated one).
+- **Fix**: don't add a `.entitlements` file for sandbox/user-selected-files; set `ENABLE_APP_SANDBOX` / `ENABLE_USER_SELECTED_FILES` build settings (which the template already does). Only add a physical entitlements file for keys with no build-setting equivalent.
+- **Display name**: the Quick Action's menu title comes from `CFBundleDisplayName`; with `GENERATE_INFOPLIST_FILE=YES` set it via the build setting `INFOPLIST_KEY_CFBundleDisplayName = "Add to AI Drop"` (do NOT also put `CFBundleDisplayName` in the manual `Info.plist` — duplicate-key build error).
+- **Rule**: before hand-wiring `CODE_SIGN_ENTITLEMENTS`, check whether `ENABLE_*` build settings already cover what you need.
+
+### [MIC-11] Mic-permission API is OS-version-dependent — branch on `#available(macOS 26)`
+- **Context**: lowered the deployment target 26 → 14. The mic code used `AVCaptureDevice` ONLY (the
+  macOS-26-correct API). It compiles fine on 14 but is a RUNTIME bug there.
+- **The truth table** (reconciles the contradictory-looking MIC-01/04/05): which API maps to
+  `kTCCServiceMicrophone` flipped across OS versions —
+  - macOS **14 / 15**: `AVAudioApplication` (`.shared.recordPermission` + `requestRecordPermission`).
+    `AVCaptureDevice.authorizationStatus(.audio)` returns a false `.denied` here (MIC-04) → the guard
+    short-circuits to the "denied" alert without ever prompting.
+  - macOS **26+**: `AVCaptureDevice` (`authorizationStatus`/`requestAccess`). `AVAudioApplication`
+    defaults `.denied` for accessory/LSUIElement apps here (MIC-05).
+- **Fix**: split both the status read AND the request behind `if #available(macOS 26, *) { AVCaptureDevice }
+  else { AVAudioApplication }` (`SpeechRecognizer.micAuthStatus()` / `requestMicAccess()`). Keep MIC-06
+  (drop overlay to `.normal` before the prompt) in BOTH branches.
+- **Rule**: TCC-API↔category mappings are not stable across macOS releases. When lowering a deployment
+  target, a clean *compile* does NOT prove permission flows — each OS band needs the API that actually
+  owns the TCC category on it. Verify on real hardware per band; a build success is necessary, not sufficient.
+
 ### [MIC-07] ENABLE_HARDENED_RUNTIME=YES silently blocks microphone without com.apple.security.device.audio-input entitlement
 - **Symptom**: `authorizationStatus` = `.denied` immediately after `tccutil reset`, no dialog ever shown, app never appears in Settings
 - **Root cause**: Hardened Runtime checks for `com.apple.security.device.audio-input` entitlement BEFORE consulting TCC. Missing entitlement = auto-deny, no user prompt, no TCC record.
@@ -209,3 +240,24 @@
 ### [GEN-02] After a correction, capture the lesson immediately
 - Don't wait until end of session — write it to tasks/lessons.md right away
 - Pattern: What was wrong → Why → Fix → Rule to prevent recurrence
+
+## Backend / Worker
+
+### [WORK-01] Client↔Worker request contract drifted silently (messages vs content)
+- **What was wrong:** the Cloudflare Worker `/v1/complete` was scaffolded for the OLD
+  single-shot API (`{ action, system, content: String }`) and validated `typeof
+  body.content !== "string"` → 400. But the chat redesign changed the app to send the
+  multi-turn array `{ system, messages: [...] }` with NO `content` field. Result: every
+  hosted free-tier call would have 400'd, and nobody noticed because the app defaults to
+  BYOK and the hosted tier is gated behind `EntitlementStore.tier != .byok`.
+- **Why:** there is no shared type / no compile-time link across the Swift↔JS boundary, and
+  no test exercises the hosted path. A protocol change on the client (`complete` → `reply`)
+  didn't fan out to the Worker.
+- **Also found:** the Worker hardcoded `max_tokens: 1024`, ignoring the per-action ceilings
+  the app sends AND re-introducing the exact 2.5-Flash cut-off (thinking tokens eat the cap).
+- **Fix:** Worker now reads `messages` (legacy `content` still accepted), forwards the full
+  multi-turn conversation, honors `body.max_tokens` with Gemini headroom
+  (`max(req+1024, 2048)` + `reasoning_effort: low`), and inlines the image into the first
+  user turn. Requires `wrangler deploy` (the agent can edit JS but cannot deploy).
+- **Rule:** when changing the `AIProvider` wire shape, grep `worker/src` in the SAME change
+  and update `/v1/complete` to match. The Worker is a provider too — treat it like one.

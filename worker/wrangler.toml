@@ -1,8 +1,10 @@
 # Cloudflare Worker — AI Drop hosted free tier (metering proxy).
 #
 # This Worker holds the host Gemini key as a SECRET (never in the app) and meters
-# usage per device: a one-time 30-call trial, then 10 calls/day. A global daily
-# circuit-breaker caps total spend so abuse can't drain the budget.
+# usage per device: a one-time 30-call trial, then a per-day TOKEN budget — the actual
+# tokens Gemini bills (input + output), so text, PDFs and IMAGES all debit fairly.
+# A global daily circuit-breaker caps total interactions so abuse can't drain the
+# budget.
 #
 # First-time setup (run these in the `worker/` folder — see README.md):
 #   npm i -g wrangler          # or: brew install cloudflare-wrangler
@@ -10,7 +12,11 @@
 #   wrangler d1 create aidrop   # then paste the printed database_id below
 #   wrangler d1 execute aidrop --remote --file=./schema.sql
 #   wrangler secret put GEMINI_API_KEY    # paste your Google AI Studio key
+#   wrangler secret put ADMIN_TOKEN       # any long random string — guards GET /v1/stats
 #   wrangler deploy
+#
+# Read the spend roll-up (operator only):
+#   curl -H "X-Admin-Token: <ADMIN_TOKEN>" https://<worker-url>/v1/stats?days=7
 # Then copy the deployed https://… URL into the app's BackendConfig.proxyBaseURL.
 
 name = "aidrop"
@@ -19,10 +25,28 @@ compatibility_date = "2025-01-01"
 
 # Tunable limits (no code change / no app release needed to adjust).
 [vars]
-TRIAL_TOTAL = "30"        # one-time free interactions per device
-FREE_DAILY_CAP = "10"     # interactions/day after the trial is used up
-GLOBAL_DAILY_CAP = "2000" # hard ceiling on TOTAL interactions/day (budget guard)
-GEMINI_MODEL = "gemini-2.5-flash"
+TRIAL_TOTAL = "30"        # one-time free interactions per device (still interaction-based)
+# Daily quota is metered in ACTUAL TOKENS billed by Gemini (input + output), captured
+# from each response — so images (and everything else) debit fairly, not just message
+# text. Tune freely server-side (no app update). Defaults ≈ today's generosity:
+# free ≈ 3 full requests' worth, pro ≈ 10. Pro bypasses the trial → straight to its budget.
+# Rough conversion: ~4 chars/token, so 40k-char request ≈ 10k input tokens.
+FREE_DAILY_TOKENS = "30000"   # free daily token budget (~3 full free requests)
+PRO_DAILY_TOKENS  = "200000"  # pro  daily token budget (~10 full pro requests)
+GLOBAL_DAILY_CAP = "2000" # hard ceiling on TOTAL interactions/day (coarse budget guard)
+GEMINI_MODEL = "gemini-2.5-flash"           # "strong" tier — capable default + fallback
+GEMINI_MODEL_FAST = "gemini-2.5-flash-lite" # "fast" tier — cheap model for mechanical tasks
+# "extra" tier — the top model, Pro only (server-verified `accounts.pro`). Fires rarely:
+# a tiny client whitelist (findBugs/refactor) + the manual "Go deeper" escalation. Free
+# devices degrade `extra` → GEMINI_MODEL (flash). OPTIONAL: unset → also falls back to
+# flash, so enabling Pro never silently jumps to a pricier model. Comment out to disable.
+GEMINI_MODEL_EXTRA = "gemini-2.5-pro"       # Pro "extra strong" tier — reserved, used sparingly
+# Per-request input ceiling (chars across all turns) — a PRE-FLIGHT guard that rejects
+# an oversized request before any spend (real token cost is only known after the call,
+# so this stays char-based). Pro is server-verified (accounts.pro = 1); a client can
+# NOT self-elevate.
+MAX_CONTENT_CHARS = "40000"      # free / BYOK tier
+MAX_CONTENT_CHARS_PRO = "80000"  # verified Pro subscribers — double
 
 # D1 database binding. Paste the database_id printed by `wrangler d1 create aidrop`.
 [[d1_databases]]

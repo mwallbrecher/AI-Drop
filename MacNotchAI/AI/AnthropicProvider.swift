@@ -8,11 +8,14 @@ final class AnthropicProvider: AIProvider {
     private let apiKey: String
     private let baseURL = "https://api.anthropic.com/v1/messages"
     private let model = "claude-haiku-4-5-20251001"
+    /// Anthropic won't cache a block below ~2048 tokens on Haiku. At ~4 chars/token
+    /// that's ~8k chars; below it we skip the `cache_control` mark entirely.
+    private static let cacheMinChars = 8000
 
     init(apiKey: String) { self.apiKey = apiKey }
     var isAvailable: Bool { !apiKey.isEmpty }
 
-    func complete(action: AIAction, content: String, imageURL: URL?) async throws -> String {
+    func reply(messages turns: [ChatTurn], imageURL: URL?, plan: RoutingPlan) async throws -> String {
         guard isAvailable else { throw AIError.noAPIKey(provider: name) }
 
         var request = URLRequest(url: URL(string: baseURL)!)
@@ -21,28 +24,53 @@ final class AnthropicProvider: AIProvider {
         request.setValue("2023-06-01", forHTTPHeaderField: "anthropic-version")
         request.setValue("application/json", forHTTPHeaderField: "Content-Type")
 
-        var messages: [[String: Any]] = []
+        // Anthropic takes the system prompt in a separate top-level field; only
+        // user/assistant turns go in `messages`. Image is inlined into the FIRST
+        // user turn using Anthropic's own content-block format.
+        let systemPrompt = turns.filter { $0.role == "system" }
+            .map(\.content).joined(separator: "\n\n")
 
-        if let imageURL, FileInspector.isImageFile(imageURL),
-           let imageData = try? Data(contentsOf: imageURL) {
-            let base64 = imageData.base64EncodedString()
-            let mime = mimeType(for: imageURL)
-            messages.append([
-                "role": "user",
-                "content": [
-                    ["type": "image", "source": ["type": "base64", "media_type": mime, "data": base64]],
-                    ["type": "text", "text": action.systemPrompt]
+        var imageUsed = false
+        let messages: [[String: Any]] = turns.compactMap { turn in
+            guard turn.role == "user" || turn.role == "assistant" else { return nil }
+            if turn.role == "user", !imageUsed,
+               let imageURL, FileInspector.isImageFile(imageURL),
+               let imageData = try? Data(contentsOf: imageURL) {
+                imageUsed = true
+                let base64 = imageData.base64EncodedString()
+                let mime = mimeType(for: imageURL)
+                return [
+                    "role": "user",
+                    "content": [
+                        ["type": "image", "source": ["type": "base64", "media_type": mime, "data": base64]],
+                        ["type": "text", "text": turn.flattenedContent]
+                    ]
                 ]
-            ])
-        } else {
-            messages.append(["role": "user", "content": content])
+            }
+            // Document on the first user turn → split into a cacheable block. The doc
+            // is byte-identical on every follow-up, so the prefix [system + this turn]
+            // hits the cache (~90% off the replayed document tokens). Only mark it when
+            // it's plausibly above Haiku's ~2048-token cache minimum — below that the
+            // mark is a no-op and a short prompt isn't worth caching anyway.
+            if turn.role == "user", let doc = turn.cacheableDocument,
+               doc.count >= Self.cacheMinChars {
+                return [
+                    "role": "user",
+                    "content": [
+                        ["type": "text", "text": turn.content],
+                        ["type": "text", "text": "--- Document(s) ---\n" + doc,
+                         "cache_control": ["type": "ephemeral"]]
+                    ]
+                ]
+            }
+            return ["role": turn.role, "content": turn.flattenedContent]
         }
 
         let body: [String: Any] = [
             "model": model,
-            "system": action.systemPrompt,
+            "system": systemPrompt,
             "messages": messages,
-            "max_tokens": 1024
+            "max_tokens": plan.maxOutputTokens
         ]
         request.httpBody = try JSONSerialization.data(withJSONObject: body)
 

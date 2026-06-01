@@ -71,31 +71,31 @@ struct OverlayView: View {
                     // Blur + dim the card content itself when a second-file drag is
                     // in progress so the session is visible as a ghosted backdrop.
                     // The overlay only adds the icon/text on top — no opaque layer.
-                    .blur(radius: (dragMonitor.isDraggingFile && vm.pendingSecondFileURL == nil) ? 3.5 : 0)
-                    .opacity((dragMonitor.isDraggingFile && vm.pendingSecondFileURL == nil) ? 0.45 : 1.0)
+                    .blur(radius: (dragMonitor.isDraggingFile && vm.pendingDroppedURLs.isEmpty) ? 3.5 : 0)
+                    .opacity((dragMonitor.isDraggingFile && vm.pendingDroppedURLs.isEmpty) ? 0.45 : 1.0)
                     .animation(.easeInOut(duration: 0.22),
-                               value: dragMonitor.isDraggingFile && vm.pendingSecondFileURL == nil)
+                               value: dragMonitor.isDraggingFile && vm.pendingDroppedURLs.isEmpty)
 
                     // Second-file drag overlay — darkens the card and shows a hint
                     // the moment the user starts dragging ANY file while a session is
                     // open, even before they bring it near the notch. Hidden once the
                     // drop lands and the banner takes over.
-                    if dragMonitor.isDraggingFile, vm.pendingSecondFileURL == nil {
+                    if dragMonitor.isDraggingFile, vm.pendingDroppedURLs.isEmpty {
                         SecondFileDragOverlay()
                             .transition(.opacity)
                     }
 
                     // Second-file prompt banner — spring-slides up from the bottom
-                    // edge of the card when a second file is dropped mid-session.
-                    if vm.pendingSecondFileURL != nil {
+                    // edge of the card when one or more files are dropped mid-session.
+                    if !vm.pendingDroppedURLs.isEmpty {
                         SecondFilePromptBanner(provider: provider)
                             .transition(.move(edge: .bottom).combined(with: .opacity))
                     }
                 }
                 .animation(.easeInOut(duration: 0.20),
-                            value: dragMonitor.isDraggingFile && vm.pendingSecondFileURL == nil)
+                            value: dragMonitor.isDraggingFile && vm.pendingDroppedURLs.isEmpty)
                 .animation(.spring(response: 0.35, dampingFraction: 0.72),
-                            value: vm.pendingSecondFileURL != nil)
+                            value: vm.pendingDroppedURLs.isEmpty)
                 .liquidGlass(cornerRadius: cornerRadius, tintOpacity: 0.60)
                 // Elastic landing deform on expand/collapse. Anchor .top pins the
                 // notch edge so only the BOTTOM edge reacts. Purely visual (a
@@ -369,54 +369,17 @@ private struct ChipsColumnView: View {
     }
 
     private func runAction(_ action: AIAction) {
-        setStage(.loading(url: fileURL, action: action))
-        let additionalURLs = vm.additionalFileURLs
-        Task {
-            do {
-                let (content, imageURL, truncated) = try await buildMultiFileContent(
-                    primary: fileURL, additional: additionalURLs)
-                let text = try await provider.complete(action: action, content: content, imageURL: imageURL)
-                OverlayViewModel.shared.contentTruncated = truncated
-                SessionHistoryStore.shared.recordTurn(
-                    primary: fileURL, additional: additionalURLs,
-                    action: action, prompt: nil, result: text)
-                setStage(.result(url: fileURL, action: action, text: text))
-            } catch {
-                setStage(.error(url: fileURL, message: error.localizedDescription))
-            }
-        }
+        sendTurn(provider: provider, fileURL: fileURL, action: action, typedPrompt: nil)
     }
 
     private func runCustomPrompt() { runCustomPromptText(vm.customPrompt) }
 
-    /// Run an arbitrary free-text prompt against the current session and log it to
-    /// History. Used by the prompt field (typed) and by tapping a History/Custom chip.
+    /// Run an arbitrary free-text prompt against the current session. Logged to
+    /// History inside sendTurn. Used by the prompt field and History/Custom chips.
     private func runCustomPromptText(_ raw: String) {
         let prompt = raw.trimmingCharacters(in: .whitespaces)
         guard !prompt.isEmpty else { return }
-        store.recordHistory(prompt)        // log every run to the History tab
-        vm.customPrompt = ""
-        vm.cachedResult = nil
-        let action = AIAction.freeform
-        setStage(.loading(url: fileURL, action: action))
-        let additionalURLs = vm.additionalFileURLs
-        Task {
-            do {
-                let (baseContent, imageURL, truncated) = try await buildMultiFileContent(
-                    primary: fileURL, additional: additionalURLs)
-                let finalContent = imageURL != nil
-                    ? "Question: \(prompt)"
-                    : "Question: \(prompt)\n\n--- Documents ---\n\(baseContent)"
-                let text = try await provider.complete(action: action, content: finalContent, imageURL: imageURL)
-                OverlayViewModel.shared.contentTruncated = truncated
-                SessionHistoryStore.shared.recordTurn(
-                    primary: fileURL, additional: additionalURLs,
-                    action: action, prompt: prompt, result: text)
-                setStage(.result(url: fileURL, action: action, text: text))
-            } catch {
-                setStage(.error(url: fileURL, message: error.localizedDescription))
-            }
-        }
+        sendTurn(provider: provider, fileURL: fileURL, action: .freeform, typedPrompt: prompt)
     }
 
     // ── Prompt tabs: Suggested / History / Custom ─────────────────────────────
@@ -568,16 +531,6 @@ private struct ChipsColumnView: View {
         if !t.isEmpty { withAnimation(.easeInOut(duration: 0.22)) { store.addCustom(t) } }
         newCustom = ""
         withAnimation(.easeInOut(duration: 0.2)) { isAddingCustom = false }
-    }
-
-    /// Set stage safely: always deferred one runloop tick so the change
-    /// never fires inside an active AppKit or SwiftUI layout pass.
-    private func setStage(_ stage: OverlayViewModel.Stage) {
-        DispatchQueue.main.async {
-            withAnimation(.spring(response: 0.32, dampingFraction: 1.0)) {
-                OverlayViewModel.shared.stage = stage
-            }
-        }
     }
 }
 
@@ -760,9 +713,21 @@ private struct TwoColumnView: View {
                 NSPasteboard.general.setString(text, forType: .string)
             }
 
-            // Re-run the last action
-            ResultIconButton(systemName: "arrow.clockwise", tooltip: "Repeat prompt") {
-                runAction(action)
+            // New conversation — clear the chat transcript but keep the same file(s),
+            // returning to the suggested actions. The only full-reset control here.
+            ResultIconButton(systemName: "arrow.clockwise", tooltip: "New conversation") {
+                withAnimation(.spring(response: 0.32, dampingFraction: 1.0)) {
+                    OverlayViewModel.shared.restartConversation(url: fileURL)
+                }
+            }
+
+            // Go deeper — Pro-only manual escalation to the most capable model. Hosted
+            // only: BYOK uses a fixed model per provider, so it can't escalate.
+            if provider is HostedProvider, EntitlementStore.shared.isPremiumUnlocked {
+                ResultIconButton(systemName: "sparkles",
+                                 tooltip: "Go deeper — re-answer with the most capable model") {
+                    goDeeper()
+                }
             }
 
             Spacer(minLength: 0)
@@ -795,19 +760,44 @@ private struct TwoColumnView: View {
             .frame(maxWidth: .infinity, minHeight: 56 * scale, alignment: .leading)
             .liquidGlass(cornerRadius: 10 * scale, tintOpacity: 0.15)
 
-        case .result(_, _, let text):
-            ScrollView(.vertical, showsIndicators: true) {
-                MarkdownText(source: text)
+        case .result:
+            // The result stage is a full chat transcript: user prompts as right-aligned
+            // bubbles, assistant replies as full-width Markdown, plus a Thinking row while
+            // a follow-up is in flight. Auto-scrolls to the newest turn.
+            ScrollViewReader { proxy in
+                ScrollView(.vertical, showsIndicators: true) {
+                    VStack(alignment: .leading, spacing: 10 * scale) {
+                        ForEach(vm.conversation) { msg in
+                            ChatBubble(message: msg).id(msg.id)
+                        }
+                        if vm.isAwaitingReply {
+                            ThinkingRow().id("thinking")
+                        }
+                    }
                     .padding(12 * scale)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                }
+                // When follow-ups are hidden the chips' vertical space is freed.
+                // .infinity lets the ScrollView grow to fill it; layoutPriority(1)
+                // ensures it wins space over the Spacer below it.
+                // When follow-ups are visible it's capped so chips stay on screen.
+                .frame(maxHeight: vm.isFollowupsExpanded ? 200 * scale : .infinity)
+                .layoutPriority(1)
+                .animation(.easeInOut(duration: 0.22), value: vm.isFollowupsExpanded)
+                .liquidGlass(cornerRadius: 10 * scale, tintOpacity: 0.60)
+                .onChange(of: vm.conversation.count) { _, _ in
+                    withAnimation(.easeOut(duration: 0.2)) {
+                        proxy.scrollTo(vm.conversation.last?.id, anchor: .bottom)
+                    }
+                }
+                .onChange(of: vm.isAwaitingReply) { _, awaiting in
+                    if awaiting {
+                        withAnimation(.easeOut(duration: 0.2)) {
+                            proxy.scrollTo("thinking", anchor: .bottom)
+                        }
+                    }
+                }
             }
-            // When follow-ups are hidden the chips' vertical space is freed.
-            // .infinity lets the ScrollView grow to fill it; layoutPriority(1)
-            // ensures it wins space over the Spacer below it.
-            // When follow-ups are visible it's capped so chips stay on screen.
-            .frame(maxHeight: vm.isFollowupsExpanded ? 200 * scale : .infinity)
-            .layoutPriority(1)
-            .animation(.easeInOut(duration: 0.22), value: vm.isFollowupsExpanded)
-            .liquidGlass(cornerRadius: 10 * scale, tintOpacity: 0.60)
 
         case .error(_, let msg):
             HStack(alignment: .top, spacing: 8 * scale) {
@@ -841,64 +831,76 @@ private struct TwoColumnView: View {
     }
 
     private func runAction(_ action: AIAction) {
-        vm.customPrompt = ""
-        vm.cachedResult = nil
-        setStage(.loading(url: fileURL, action: action))
-        let additionalURLs = vm.additionalFileURLs
-        Task {
-            do {
-                let (content, imageURL, truncated) = try await buildMultiFileContent(
-                    primary: fileURL, additional: additionalURLs)
-                let text = try await provider.complete(action: action, content: content, imageURL: imageURL)
-                OverlayViewModel.shared.contentTruncated = truncated
-                SessionHistoryStore.shared.recordTurn(
-                    primary: fileURL, additional: additionalURLs,
-                    action: action, prompt: nil, result: text)
-                setStage(.result(url: fileURL, action: action, text: text))
-            } catch {
-                setStage(.error(url: fileURL, message: error.localizedDescription))
-            }
-        }
+        sendTurn(provider: provider, fileURL: fileURL, action: action, typedPrompt: nil)
     }
 
     private func runCustomPrompt() {
         let prompt = vm.customPrompt.trimmingCharacters(in: .whitespaces)
         guard !prompt.isEmpty else { return }
-        PromptStore.shared.recordHistory(prompt)   // log to History tab
-        vm.customPrompt = ""
-        vm.cachedResult = nil
-        let action = AIAction.freeform
-        setStage(.loading(url: fileURL, action: action))
-        let additionalURLs = vm.additionalFileURLs
-        Task {
-            do {
-                let (baseContent, imageURL, truncated) = try await buildMultiFileContent(
-                    primary: fileURL, additional: additionalURLs)
-                let finalContent = imageURL != nil
-                    ? "Question: \(prompt)"
-                    : "Question: \(prompt)\n\n--- Documents ---\n\(baseContent)"
-                let text = try await provider.complete(action: action, content: finalContent, imageURL: imageURL)
-                OverlayViewModel.shared.contentTruncated = truncated
-                SessionHistoryStore.shared.recordTurn(
-                    primary: fileURL, additional: additionalURLs,
-                    action: action, prompt: prompt, result: text)
-                setStage(.result(url: fileURL, action: action, text: text))
-            } catch {
-                setStage(.error(url: fileURL, message: error.localizedDescription))
-            }
-        }
+        sendTurn(provider: provider, fileURL: fileURL, action: .freeform, typedPrompt: prompt)
     }
 
-    /// Always deferred one runloop tick — never called during an active layout pass.
-    private func setStage(_ stage: OverlayViewModel.Stage) {
-        DispatchQueue.main.async {
-            // Collapse follow-ups whenever a fresh result arrives so the section
-            // starts closed and the user can expand it on demand.
-            if case .result = stage { OverlayViewModel.shared.isFollowupsExpanded = false }
-            withAnimation(.spring(response: 0.32, dampingFraction: 1.0)) {
-                OverlayViewModel.shared.stage = stage
+    /// Manual escalation: re-answer the last turn on the most capable model. Pro-only,
+    /// hosted-only (gated at the call site), so the pricey model fires only on demand.
+    private func goDeeper() {
+        guard case .result(_, let action, _) = vm.stage else { return }
+        sendTurn(provider: provider, fileURL: fileURL, action: action,
+                 typedPrompt: nil, forceTier: .extraStrong, regenerate: true)
+    }
+}
+
+// MARK: - Chat transcript rows
+
+/// One transcript line. User prompts render as a right-aligned tinted capsule;
+/// assistant replies render full-width as Markdown.
+private struct ChatBubble: View {
+    let message: OverlayViewModel.ChatMessage
+    @Environment(\.uiScale) private var scale
+
+    var body: some View {
+        switch message.role {
+        case .user:
+            HStack(spacing: 0) {
+                Spacer(minLength: 28 * scale)
+                Text(message.display)
+                    .font(.system(size: 12 * scale, weight: .medium))
+                    .foregroundColor(.white)
+                    .multilineTextAlignment(.leading)
+                    .padding(.horizontal, 11 * scale)
+                    .padding(.vertical, 7 * scale)
+                    .background(
+                        RoundedRectangle(cornerRadius: 12 * scale, style: .continuous)
+                            .fill(Color.accentColor.opacity(0.32))
+                            .overlay(
+                                RoundedRectangle(cornerRadius: 12 * scale, style: .continuous)
+                                    .strokeBorder(Color.white.opacity(0.14), lineWidth: 0.5)
+                            )
+                    )
+                    .textSelection(.enabled)
             }
+            .frame(maxWidth: .infinity, alignment: .trailing)
+        case .assistant:
+            MarkdownText(source: message.display)
+                .frame(maxWidth: .infinity, alignment: .leading)
         }
+    }
+}
+
+/// "Thinking…" row shown beneath the transcript while a follow-up reply is in flight.
+private struct ThinkingRow: View {
+    @Environment(\.uiScale) private var scale
+    var body: some View {
+        HStack(spacing: 8 * scale) {
+            ProgressView()
+                .progressViewStyle(.circular)
+                .scaleEffect(0.55 * scale)
+                .tint(.white)
+            Text("Thinking…")
+                .font(.system(size: 12 * scale))
+                .foregroundColor(.white.opacity(0.45))
+            Spacer(minLength: 0)
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
     }
 }
 
@@ -1677,6 +1679,160 @@ struct ActionChip: View {
     }
 }
 
+// MARK: - Conversation orchestrator
+//
+// Every chip tap and typed prompt funnels through sendTurn() so the result stage is
+// one continuous chat transcript, not a series of one-shot answers. The document is
+// extracted ONCE per session (cached in vm.baseContext) and the WHOLE conversation is
+// re-sent every turn, so follow-ups keep the file context without re-reading the file.
+
+/// Deferred stage write (one runloop tick). Shared by both run sites — mirrors the
+/// per-view setStage(): never mutate `stage` inside an active layout pass. Entering
+/// .result collapses follow-ups so the section starts closed.
+@MainActor
+private func applyStage(_ stage: OverlayViewModel.Stage) {
+    DispatchQueue.main.async {
+        if case .result = stage { OverlayViewModel.shared.isFollowupsExpanded = false }
+        withAnimation(.spring(response: 0.32, dampingFraction: 1.0)) {
+            OverlayViewModel.shared.stage = stage
+        }
+    }
+}
+
+/// Append one turn to the conversation and stream back the assistant's reply.
+/// - action: the chip's action, or `.freeform` for a typed prompt.
+/// - typedPrompt: the raw text the user typed; `nil` for a chip tap.
+/// - forceTier: override the routed model tier (the manual "Go deeper" forces `.extraStrong`).
+/// - regenerate: re-answer the EXISTING last user turn on a different model — drops the
+///   stale assistant reply and adds no new user bubble (used by "Go deeper").
+@MainActor
+private func sendTurn(provider: any AIProvider,
+                      fileURL: URL,
+                      action: AIAction,
+                      typedPrompt: String?,
+                      forceTier: AITier? = nil,
+                      regenerate: Bool = false) {
+    let vm = OverlayViewModel.shared
+
+    // What the user's bubble shows vs. what the model receives as this turn's text.
+    let display     = typedPrompt ?? action.rawValue
+    let instruction = typedPrompt ?? action.systemPrompt
+
+    if let typed = typedPrompt { PromptStore.shared.recordHistory(typed) }
+    vm.customPrompt = ""
+    vm.cachedResult = nil
+
+    // Is a transcript already on screen? (Determines loading-card vs. thinking-row.)
+    let showsTranscript: Bool = { if case .result = vm.stage { return true }; return false }()
+    let priorTurns = vm.conversation.count
+
+    if regenerate {
+        // "Go deeper": re-answer the existing last user turn on a stronger model.
+        // Drop the stale assistant reply; do NOT add a new user bubble.
+        if vm.conversation.last?.role == .assistant { vm.conversation.removeLast() }
+    } else {
+        // Optimistic user bubble.
+        vm.conversation.append(.init(role: .user, display: display, modelText: instruction))
+    }
+
+    if showsTranscript {
+        vm.isAwaitingReply = true            // thinking row appears beneath transcript
+    } else {
+        applyStage(.loading(url: fileURL, action: action))
+    }
+
+    let additionalURLs = vm.additionalFileURLs
+
+    Task {
+        do {
+            // Extract the document ONCE per session; reuse for every turn.
+            let base: OverlayViewModel.BaseContext
+            if let cached = vm.baseContext {
+                base = cached
+            } else {
+                // Pro/subscribers read twice as much of a file before truncation.
+                // Resolved on the main actor here; the Worker enforces a matching
+                // server-verified ceiling so this can't be spoofed for spend.
+                let charLimit = EntitlementStore.shared.isPremiumUnlocked
+                    ? FileContentExtractor.maxCharsPro : FileContentExtractor.maxChars
+                let (content, imageURL, truncated) = try await buildMultiFileContent(
+                    primary: fileURL, additional: additionalURLs, charLimit: charLimit)
+                base = .init(content: content, imageURL: imageURL, truncated: truncated)
+                vm.baseContext = base
+            }
+
+            let turns = buildChatTurns(conversation: vm.conversation,
+                                       baseContent: base.content,
+                                       imageURL: base.imageURL)
+            // Routing decision (model tier + output ceiling). A typed prompt routes
+            // through the non-load-bearing heuristic; a chip uses its action's static plan.
+            // `forceTier` (manual "Go deeper") overrides the tier, keeping the ceiling.
+            let basePlan = typedPrompt.map(RoutingPlan.forCustomPrompt) ?? action.routing
+            let plan = forceTier.map { basePlan.with(tier: $0) } ?? basePlan
+            let text = try await provider.reply(messages: turns, imageURL: base.imageURL,
+                                                plan: plan)
+
+            vm.contentTruncated = base.truncated
+            vm.isAwaitingReply  = false
+            vm.conversation.append(.init(role: .assistant, display: text, modelText: text))
+            // Don't double-log a regeneration — it answers an already-recorded turn.
+            if !regenerate {
+                SessionHistoryStore.shared.recordTurn(
+                    primary: fileURL, additional: additionalURLs,
+                    action: action, prompt: typedPrompt, result: text)
+            }
+            applyStage(.result(url: fileURL, action: action, text: text))
+        } catch {
+            vm.isAwaitingReply = false
+            let msg = error.localizedDescription
+            if priorTurns > 0 {
+                // Keep the transcript — surface the failure as an assistant note.
+                let note = "⚠️ \(msg)"
+                vm.conversation.append(.init(role: .assistant, display: note, modelText: note))
+                applyStage(.result(url: fileURL, action: action, text: note))
+            } else {
+                // Nothing on screen yet — show the error stage (drops the lone bubble).
+                vm.conversation.removeAll()
+                applyStage(.error(url: fileURL, message: msg))
+            }
+        }
+    }
+}
+
+/// Serialise the transcript into provider ChatTurns. A leading system turn sets the
+/// persona; the FIRST user turn carries the extracted document appended to its
+/// instruction (skipped for image sessions — the image is attached separately).
+@MainActor
+private func buildChatTurns(conversation: [OverlayViewModel.ChatMessage],
+                            baseContent: String,
+                            imageURL: URL?) -> [ChatTurn] {
+    var turns: [ChatTurn] = [
+        ChatTurn(role: "system", content:
+            "You are AI Drop, a concise assistant embedded in macOS. The user dropped a "
+            + "document or image and asks about it. Answer directly and format replies "
+            + "in Markdown.")
+    ]
+    var documentAttached = false
+    for msg in conversation {
+        switch msg.role {
+        case .user:
+            // The document rides on the FIRST user turn as a SEPARATE, stable block
+            // (`cacheableDocument`) so prompt caching can target it (doc §6). Image
+            // sessions attach the image instead, so they carry no document.
+            if !documentAttached {
+                documentAttached = true
+                let doc = (imageURL == nil && !baseContent.isEmpty) ? baseContent : nil
+                turns.append(ChatTurn(role: "user", content: msg.modelText, cacheableDocument: doc))
+            } else {
+                turns.append(ChatTurn(role: "user", content: msg.modelText))
+            }
+        case .assistant:
+            turns.append(ChatTurn(role: "assistant", content: msg.display))
+        }
+    }
+    return turns
+}
+
 // MARK: - Multi-file content builder
 
 /// Extracts and joins content from all files in the session.
@@ -1687,7 +1843,8 @@ struct ActionChip: View {
 /// file's content was cut to fit the extractor's char/page cap.
 private func buildMultiFileContent(
     primary fileURL: URL,
-    additional additionalURLs: [URL]
+    additional additionalURLs: [URL],
+    charLimit: Int = FileContentExtractor.maxChars
 ) async throws -> (content: String, imageURL: URL?, truncated: Bool) {
     let allURLs = [fileURL] + additionalURLs
 
@@ -1698,7 +1855,7 @@ private func buildMultiFileContent(
 
     // ── Single non-image ──────────────────────────────────────────────────────
     if allURLs.count == 1 {
-        let result = try await FileContentExtractor.extract(from: allURLs[0])
+        let result = try await FileContentExtractor.extract(from: allURLs[0], limit: charLimit)
         return (result.text, nil, result.truncated)
     }
 
@@ -1711,7 +1868,7 @@ private func buildMultiFileContent(
             // Vision analysis is only available for single-image sessions;
             // in multi-file mode describe the image by name / context.
             body = "[Image: \(url.lastPathComponent) — visual description not available in multi-file mode]"
-        } else if let result = try? await FileContentExtractor.extract(from: url) {
+        } else if let result = try? await FileContentExtractor.extract(from: url, limit: charLimit) {
             body = result.text
             anyTruncated = anyTruncated || result.truncated
         } else {
@@ -1785,7 +1942,12 @@ private struct SecondFilePromptBanner: View {
     @Environment(\.uiScale) private var scale
 
     var body: some View {
-        guard let url = vm.pendingSecondFileURL else { return AnyView(EmptyView()) }
+        let urls = vm.pendingDroppedURLs
+        guard let first = urls.first else { return AnyView(EmptyView()) }
+
+        // Title: single filename, or "N files" for a batch.
+        let title = urls.count == 1 ? first.lastPathComponent : "\(urls.count) files"
+        let addLabel = urls.count == 1 ? "Add to session" : "Add \(urls.count) files"
 
         return AnyView(
             VStack(alignment: .leading, spacing: 8 * scale) {
@@ -1795,7 +1957,7 @@ private struct SecondFilePromptBanner: View {
                     Image(systemName: "doc.badge.plus")
                         .font(.system(size: 11 * scale, weight: .semibold))
                         .foregroundColor(.white.opacity(0.65))
-                    Text(url.lastPathComponent)
+                    Text(title)
                         .font(.system(size: 11 * scale, weight: .semibold))
                         .foregroundColor(.white)
                         .lineLimit(1)
@@ -1804,7 +1966,7 @@ private struct SecondFilePromptBanner: View {
                     // Dismiss / cancel
                     Button {
                         withAnimation(.spring(response: 0.28, dampingFraction: 0.80)) {
-                            vm.pendingSecondFileURL = nil
+                            vm.pendingDroppedURLs = []
                         }
                     } label: {
                         Image(systemName: "xmark")
@@ -1820,8 +1982,8 @@ private struct SecondFilePromptBanner: View {
                 HStack(spacing: 8 * scale) {
 
                     // Add to session
-                    Button { addToSession(url: url) } label: {
-                        Label("Add to session", systemImage: "plus.circle.fill")
+                    Button { addToSession(urls: urls) } label: {
+                        Label(addLabel, systemImage: "plus.circle.fill")
                             .font(.system(size: 11 * scale, weight: .semibold))
                             .foregroundColor(.white)
                             .frame(maxWidth: .infinity)
@@ -1830,10 +1992,10 @@ private struct SecondFilePromptBanner: View {
                             .clipShape(Capsule(style: .continuous))
                     }
                     .buttonStyle(.plain)
-                    .help("Analyse both files together in the current session")
+                    .help("Analyse all files together in the current session")
 
                     // New session
-                    Button { startNewSession(url: url) } label: {
+                    Button { startNewSession(urls: urls) } label: {
                         Label("New session", systemImage: "arrow.counterclockwise")
                             .font(.system(size: 11 * scale, weight: .medium))
                             .foregroundColor(.white.opacity(0.85))
@@ -1842,7 +2004,7 @@ private struct SecondFilePromptBanner: View {
                             .liquidGlassCapsule(tintOpacity: 0.38)
                     }
                     .buttonStyle(.plain)
-                    .help("Start a new session with only the new file")
+                    .help("Start a new session with only the new file(s)")
                 }
             }
             .padding(.horizontal, 12 * scale)
@@ -1863,10 +2025,19 @@ private struct SecondFilePromptBanner: View {
         )
     }
 
-    private func addToSession(url: URL) {
+    private func addToSession(urls: [URL]) {
+        // Only analysable files join the session; the drop layer already filtered,
+        // but guard again so a Finder/legacy path can't sneak an unsupported type in.
+        let supported = urls.filter { !FileInspector.isUnsupportedFileType($0) }
+        guard !supported.isEmpty else {
+            withAnimation(.spring(response: 0.28, dampingFraction: 0.80)) {
+                vm.pendingDroppedURLs = []
+            }
+            return
+        }
         withAnimation(.spring(response: 0.32, dampingFraction: 0.68)) {
-            vm.additionalFileURLs.append(url)
-            vm.pendingSecondFileURL = nil
+            vm.additionalFileURLs.append(contentsOf: supported)
+            vm.pendingDroppedURLs = []
             // Update chip actions to the union of all files in the session
             if case .chips(let primaryURL, _) = vm.stage {
                 let allURLs = [primaryURL] + vm.additionalFileURLs
@@ -1878,10 +2049,10 @@ private struct SecondFilePromptBanner: View {
         }
     }
 
-    private func startNewSession(url: URL) {
+    private func startNewSession(urls: [URL]) {
         withAnimation(.spring(response: 0.32, dampingFraction: 0.68)) {
-            vm.pendingSecondFileURL = nil
-            vm.setChips(url: url)   // setChips() clears additionalFileURLs
+            vm.pendingDroppedURLs = []
+            vm.setChips(urls: urls)   // setChips() resets additionalFileURLs to the batch
         }
     }
 }

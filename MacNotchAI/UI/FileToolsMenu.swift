@@ -30,6 +30,12 @@ struct FileToolsButton: View {
 
     private var tools: [FileTool] { FileTool.tools(for: fileURL, sessionFiles: sessionFiles) }
 
+    /// Stitch needs ≥ 2 PDFs in the session; otherwise the item shows greyed out
+    /// with a hover hint telling the user to drop a second PDF.
+    private var stitchEnabled: Bool {
+        sessionFiles.filter { $0.pathExtension.lowercased() == "pdf" }.count >= 2
+    }
+
     var body: some View {
         Menu {
             ForEach(tools) { tool in
@@ -39,6 +45,11 @@ struct FileToolsButton: View {
                 Button { perform(tool) } label: {
                     Label(tool.title, systemImage: tool.systemImage)
                 }
+                .disabled(tool == .stitchPDFs && !stitchEnabled)
+                .help(tool == .stitchPDFs
+                      ? (stitchEnabled ? "Merge the session’s PDFs into one"
+                                       : "Drop a second PDF to stitch them")
+                      : "")
             }
 
             Divider()

@@ -25,17 +25,18 @@ final class OllamaProvider: AIProvider {
         return available
     }
 
-    func complete(action: AIAction, content: String, imageURL: URL?) async throws -> String {
+    func reply(messages: [ChatTurn], imageURL: URL?, plan: RoutingPlan) async throws -> String {
         var request = URLRequest(url: URL(string: baseURL)!)
         request.httpMethod = "POST"
         request.setValue("application/json", forHTTPHeaderField: "Content-Type")
 
+        // Local llama3.1 is text-only — attachImage: false. Local inference is free,
+        // so the ceiling here is only a runaway guard (stops a looping model burning
+        // CPU/battery), never a bill saving.
         let body: [String: Any] = [
             "model": model,
-            "messages": [
-                ["role": "system", "content": action.systemPrompt],
-                ["role": "user",   "content": content]
-            ],
+            "messages": openAICompatMessages(messages, imageURL: imageURL, attachImage: false),
+            "max_tokens": plan.maxOutputTokens,
             "stream": false
         ]
         request.httpBody = try JSONSerialization.data(withJSONObject: body)

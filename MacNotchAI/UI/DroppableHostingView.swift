@@ -17,7 +17,7 @@ final class DroppableHostingView<Content: View>: NSHostingView<Content> {
     // is alive and the pasteboard is open), so the read is always fast there.
     // Cache the result and reuse it in performDragOperation so we never touch
     // the pasteboard again at drop time.
-    private var cachedDropURL: URL?
+    private var cachedDropURLs: [URL] = []
 
     required init(rootView: Content) {
         super.init(rootView: rootView)
@@ -45,9 +45,10 @@ final class DroppableHostingView<Content: View>: NSHostingView<Content> {
     var wantsPeriodicDraggingUpdates: Bool { false }
 
     override func draggingEntered(_ sender: NSDraggingInfo) -> NSDragOperation {
-        guard let url = extractURL(from: sender.draggingPasteboard) else { return [] }
+        let urls = extractURLs(from: sender.draggingPasteboard)
+        guard !urls.isEmpty else { return [] }
         // Cache here — pasteboard is fully open while the drag is in flight.
-        cachedDropURL = url
+        cachedDropURLs = urls
         // Hover only when cursor is actually over the visible pill, not the transparent
         // canvas that surrounds it. The window is 288×96 but the pill is only 240×68
         // pinned to the top — the 28pt strip below the pill is transparent dead space.
@@ -56,8 +57,8 @@ final class DroppableHostingView<Content: View>: NSHostingView<Content> {
     }
 
     override func draggingUpdated(_ sender: NSDraggingInfo) -> NSDragOperation {
-        // URL already cached from draggingEntered — no second pasteboard read needed.
-        guard cachedDropURL != nil else { return [] }
+        // URLs already cached from draggingEntered — no second pasteboard read needed.
+        guard !cachedDropURLs.isEmpty else { return [] }
         // Re-evaluate hover as the cursor moves within the window so the jelly fires
         // exactly when the cursor crosses into the pill, not into the canvas border.
         OverlayViewModel.shared.isDragHovering = isOverPillArea(sender)
@@ -65,7 +66,7 @@ final class DroppableHostingView<Content: View>: NSHostingView<Content> {
     }
 
     override func draggingExited(_ sender: NSDraggingInfo?) {
-        cachedDropURL = nil
+        cachedDropURLs = []
         OverlayViewModel.shared.isDragHovering = false
     }
 
@@ -78,33 +79,36 @@ final class DroppableHostingView<Content: View>: NSHostingView<Content> {
         OverlayViewModel.shared.isDragHovering = false
         DragMonitor.shared.dragCompleted()
 
-        guard let url = cachedDropURL else { cachedDropURL = nil; return false }
-        cachedDropURL = nil
+        let urls = cachedDropURLs
+        cachedDropURLs = []
+        guard let first = urls.first else { return false }
 
         let vm = OverlayViewModel.shared
 
         // ── Active session: offer add/replace ────────────────────────────────────
         // Stage 2/3 is open — don't replace the session silently. Instead set the
-        // pending URL so the banner prompt appears inside the card.
+        // pending URLs so the (batch-aware) banner prompt appears inside the card.
         guard case .waitingForDrop = vm.stage else {
-            // Unsupported types can't be added to a session either
-            guard !FileInspector.isUnsupportedFileType(url) else { return false }
+            // Only the analysable files can be added to a session.
+            let supported = urls.filter { !FileInspector.isUnsupportedFileType($0) }
+            guard !supported.isEmpty else { return false }
             withAnimation(.spring(response: 0.36, dampingFraction: 1.0)) {
-                vm.pendingSecondFileURL = url
+                vm.pendingDroppedURLs = supported
             }
             return true
         }
 
-        // ── Normal first-file flow ────────────────────────────────────────────────
-        if FileInspector.isUnsupportedFileType(url) {
+        // ── Normal first-drop flow (one or many files → one session) ──────────────
+        let supported = urls.filter { !FileInspector.isUnsupportedFileType($0) }
+        if supported.isEmpty {
             vm.stage = .error(
-                url: url,
-                message: "\"\(url.lastPathComponent)\" can't be analysed.\nAI Drop supports PDF, text, images, and code files."
+                url: first,
+                message: "\"\(first.lastPathComponent)\" can't be analysed.\nAI Drop supports PDF, text, images, and code files."
             )
             return true
         }
         withAnimation(.spring(response: 0.34, dampingFraction: 1.0)) {
-            vm.setChips(url: url)
+            vm.setChips(urls: supported)
         }
         return true
     }
@@ -146,20 +150,20 @@ final class DroppableHostingView<Content: View>: NSHostingView<Content> {
 
     // MARK: - Helper
 
-    private func extractURL(from pasteboard: NSPasteboard) -> URL? {
-        // Primary: modern fileURL type
+    private func extractURLs(from pasteboard: NSPasteboard) -> [URL] {
+        // Primary: modern fileURL type — returns ALL dragged files in order.
         if let urls = pasteboard.readObjects(
             forClasses: [NSURL.self],
             options: [.urlReadingFileURLsOnly: true]
-        ) as? [URL], let first = urls.first {
-            return first
+        ) as? [URL], !urls.isEmpty {
+            return urls
         }
         // Fallback: legacy NSFilenamesPboardType (older apps, Finder on some OS versions)
         if let paths = pasteboard.propertyList(
             forType: NSPasteboard.PasteboardType("NSFilenamesPboardType")
-        ) as? [String], let path = paths.first {
-            return URL(fileURLWithPath: path)
+        ) as? [String], !paths.isEmpty {
+            return paths.map { URL(fileURLWithPath: $0) }
         }
-        return nil
+        return []
     }
 }

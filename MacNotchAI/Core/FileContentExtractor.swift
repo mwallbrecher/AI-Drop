@@ -4,20 +4,29 @@ import PDFKit
 
 struct FileContentExtractor {
 
-    /// Hard cap on extracted characters so a huge file can't blow the model's
-    /// context window. When the source exceeds this, `extract` flags `truncated`
-    /// so the UI can tell the user only the first part was analysed.
-    static let maxChars = 12_000
+    /// Hard cap on extracted characters. Bounds input-token cost (input dominates
+    /// document tasks) and keeps the client under the Worker's per-request ceiling.
+    /// When the source exceeds the active cap, `extract` flags `truncated` so the UI
+    /// can tell the user only the first part was analysed. **Free / BYOK tier.**
+    static let maxChars = 24_000
+
+    /// Pro / subscriber char cap — double the free cap. Longer documents are analysed
+    /// in full, at proportionally higher input cost. The active cap is chosen at the
+    /// call site from the entitlement (see `buildMultiFileContent`) and matched by the
+    /// Worker's server-verified Pro ceiling (`MAX_CONTENT_CHARS_PRO`).
+    static let maxCharsPro = 48_000
 
     /// Result of an extraction. `truncated` is true when the source was larger
-    /// than `maxChars` (or, for PDFs, longer than the 20-page cap) and the text
-    /// returned is only the leading slice.
+    /// than the active char cap (or, for PDFs, longer than the 20-page cap) and the
+    /// text returned is only the leading slice.
     struct Result {
         let text: String
         let truncated: Bool
     }
 
-    static func extract(from url: URL) async throws -> Result {
+    /// - Parameter limit: char cap to apply (defaults to the free-tier `maxChars`;
+    ///   callers pass `maxCharsPro` for entitled users).
+    static func extract(from url: URL, limit: Int = FileContentExtractor.maxChars) async throws -> Result {
         // Under Hardened Runtime, URLs received via drag-and-drop from Finder
         // arrive as security-scoped URLs. startAccessingSecurityScopedResource()
         // is required to read them; for plain path URLs it is a harmless no-op.
@@ -28,27 +37,27 @@ struct FileContentExtractor {
 
         switch ext {
         case "pdf":
-            return try extractPDF(from: url)
+            return try extractPDF(from: url, limit: limit)
 
         case "rtf", "rtfd", "doc", "docx":
             // Rich-text formats (RTF, Word) — decoded via the Cocoa text system,
             // which reads .docx (Office Open XML) natively. Run on the main actor:
             // the rich-text importers are not guaranteed thread-safe.
             let raw = try await MainActor.run { try extractRichText(from: url) }
-            return capped(raw)
+            return capped(raw, limit: limit)
 
         case "png", "jpg", "jpeg", "heic", "webp", "tiff":
             return Result(text: "IMAGE_FILE", truncated: false)
 
         default:
             // Plain text / code — encoding-detecting read (not just UTF-8).
-            return capped(try readText(from: url))
+            return capped(try readText(from: url), limit: limit)
         }
     }
 
     // MARK: - Format readers
 
-    private static func extractPDF(from url: URL) throws -> Result {
+    private static func extractPDF(from url: URL, limit: Int) throws -> Result {
         // Security scope is already active from the caller (extract).
         guard let pdf = PDFDocument(url: url) else {
             throw ExtractionError.cannotOpenPDF
@@ -66,7 +75,7 @@ struct FileContentExtractor {
         }
         // Truncated if we skipped pages OR the text overflows the char cap.
         let pagesSkipped = pdf.pageCount > maxPages
-        let result = capped(text)
+        let result = capped(text, limit: limit)
         return Result(text: result.text, truncated: result.truncated || pagesSkipped)
     }
 
@@ -107,9 +116,9 @@ struct FileContentExtractor {
 
     // MARK: - Helpers
 
-    private static func capped(_ text: String) -> Result {
-        if text.count > maxChars {
-            return Result(text: String(text.prefix(maxChars)), truncated: true)
+    private static func capped(_ text: String, limit: Int) -> Result {
+        if text.count > limit {
+            return Result(text: String(text.prefix(limit)), truncated: true)
         }
         return Result(text: text, truncated: false)
     }
