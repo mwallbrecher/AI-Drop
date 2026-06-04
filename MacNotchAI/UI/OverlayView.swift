@@ -64,6 +64,12 @@ struct OverlayView: View {
                                     insertion: .move(edge: .trailing).combined(with: .opacity),
                                     removal: .opacity
                                 ))
+                        case .fileResult(let original, let output, let tool):
+                            FileResultView(original: original, output: output, tool: tool)
+                                .transition(.asymmetric(
+                                    insertion: .move(edge: .trailing).combined(with: .opacity),
+                                    removal: .opacity
+                                ))
                         default:
                             EmptyView()
                         }
@@ -307,6 +313,21 @@ private struct WaitingPillView: View {
 
 // MARK: - Stage 2: Chips column only
 
+/// Scroll geometry of the chips-stage tab list, used to drive the custom scroll indicator.
+/// `offset` is the content top relative to the viewport (0 at top, negative when scrolled);
+/// `contentHeight` is the full (unclamped) height of the rows.
+private struct ChipsScrollMetrics: Equatable {
+    var offset: CGFloat
+    var contentHeight: CGFloat
+}
+
+private struct ChipsScrollMetricsKey: PreferenceKey {
+    static var defaultValue = ChipsScrollMetrics(offset: 0, contentHeight: 0)
+    static func reduce(value: inout ChipsScrollMetrics, nextValue: () -> ChipsScrollMetrics) {
+        value = nextValue()
+    }
+}
+
 private struct ChipsColumnView: View {
     let fileURL: URL
     let actions: [AIAction]
@@ -319,6 +340,13 @@ private struct ChipsColumnView: View {
     // Inline "add custom prompt" composer state (Custom tab "+" row).
     @State private var isAddingCustom = false
     @State private var newCustom = ""
+    /// The media utility currently running (async AVFoundation/Speech op) — drives its
+    /// row spinner and blocks re-entrancy while in flight. `nil` = idle.
+    @State private var runningTool: FileTool?
+    /// Live scroll offset + content height of the tab list, fed by a GeometryReader so the
+    /// custom (thin, dim) scroll indicator can position its knob. (The native macOS scroller
+    /// can't be made smaller/darker, so we hide it and draw our own.)
+    @State private var scrollMetrics = ChipsScrollMetrics(offset: 0, contentHeight: 0)
     @FocusState private var customFieldFocused: Bool
 
     var body: some View {
@@ -326,7 +354,9 @@ private struct ChipsColumnView: View {
             FileHeaderView(fileURL: fileURL, closeNS: closeNS)
                 .zIndex(100)   // floating name badge must render above chips below it
 
-            if vm.isChipsExpanded {
+            // Media sessions stay permanently expanded (there is no prompt field to
+            // collapse down to), so the Utilities + Open-in content always shows.
+            if vm.isChipsExpanded || isMediaSession {
                 chipsTabBar
                     .transition(.asymmetric(
                         // Delay insertion so the window finishes resizing before
@@ -341,9 +371,20 @@ private struct ChipsColumnView: View {
                                            .animation(.spring(response: 0.28, dampingFraction: 0.7).delay(0.15)),
                         removal:   .opacity.animation(.easeIn(duration: 0.07))
                     ))
+
+                // Pillar 1: numbered "Open in" launch row for the user's favorite apps.
+                ToolRow()
+                    .transition(.asymmetric(
+                        insertion: .opacity.animation(.easeOut(duration: 0.12).delay(0.17)),
+                        removal:   .opacity.animation(.easeIn(duration: 0.07))
+                    ))
             }
 
-            PromptField(text: $vm.customPrompt, onSubmit: runCustomPrompt)
+            // Video/audio carries no hosted-AI path — hide the prompt field so the
+            // model can never be invoked for it (zero operator token cost).
+            if !isMediaSession {
+                PromptField(text: $vm.customPrompt, onSubmit: runCustomPrompt)
+            }
 
             // Handoff confirmation pill — pops in ~0.18 s after navigation, stays
             // 6 s then dissolves with a wobbly spring so it feels alive not abrupt.
@@ -368,6 +409,11 @@ private struct ChipsColumnView: View {
         .frame(width: 280 * scale, alignment: .topLeading)
     }
 
+    /// Video/audio: no hosted-AI actions apply. The chips stage shows only file
+    /// Utilities + the "Open in" launch row — no prompt field, no AI tabs — so the
+    /// model is never invoked for media (zero operator token cost).
+    private var isMediaSession: Bool { FileInspector.isMediaFile(fileURL) }
+
     private func runAction(_ action: AIAction) {
         sendTurn(provider: provider, fileURL: fileURL, action: action, typedPrompt: nil)
     }
@@ -384,25 +430,63 @@ private struct ChipsColumnView: View {
 
     // ── Prompt tabs: Suggested / History / Custom ─────────────────────────────
 
+    /// File-utility actions for the current file/session (Utilities tab). Shared by
+    /// the content view and the row-count calc so the window height stays in sync.
+    private var utilityTools: [FileTool] {
+        FileToolActions.utilityTools(for: fileURL, sessionFiles: vm.sessionFileURLs)
+    }
+
     /// Logical (unclamped) row count of the active tab — must match the value
     /// AppDelegate.resizeOverlay uses so the window height fits the content region.
     private var currentRowCount: Int {
         ChipsLayout.rows(for: vm.chipsTab,
                          suggested: actions.count,
                          history: store.history.count,
-                         custom: store.customPrompts.count)
+                         custom: store.customPrompts.count,
+                         utilities: utilityTools.count)
     }
 
     private var chipsTabBar: some View {
-        // Spacing 0: each tabButton already carries transparent hit-padding,
-        // so the buttons sit flush with no dead zones between them.
-        HStack(spacing: 0) {
-            tabButton(.suggested, icon: "sparkles.2",        help: "Suggested")
-            tabButton(.history,   icon: "list.bullet",       help: "History")
-            tabButton(.custom,    icon: "slider.vertical.3",  help: "Custom prompts")
+        // Two captioned groups side by side: the three AI prompt tabs under an
+        // "AI Insights" caption, and the file-utility tab under "Utilities". Each
+        // group is a VStack(caption, icons) so the tiny caption sits over its own
+        // tabs. Total height = ChipsLayout.tabBarHeight (caption + gap + icon row).
+        HStack(alignment: .bottom, spacing: 16 * scale) {
+            // Media (video/audio) has no AI path — show only the Utilities group.
+            if !isMediaSession {
+                tabGroup(caption: "AI Insights", captionIcon: "sparkles") {
+                    tabButton(.suggested, icon: "sparkles.2",       help: "Suggested")
+                    tabButton(.history,   icon: "list.bullet",      help: "History")
+                    tabButton(.custom,    icon: "slider.vertical.3", help: "Custom prompts")
+                }
+            }
+            tabGroup(caption: "Utilities", captionIcon: "wrench.and.screwdriver") {
+                tabButton(.utilities, icon: "wrench.and.screwdriver", help: "File utilities")
+            }
             Spacer(minLength: 0)
         }
-        .frame(height: ChipsLayout.tabBarHeight * scale)
+        .frame(height: ChipsLayout.tabBarHeight * scale, alignment: .bottom)
+    }
+
+    /// One captioned tab group: a tiny icon + label caption above a flush row of
+    /// tab buttons. Spacing 0 between buttons — each carries its own hit-padding.
+    @ViewBuilder
+    private func tabGroup<Content: View>(
+        caption: String, captionIcon: String, @ViewBuilder _ tabs: () -> Content
+    ) -> some View {
+        VStack(alignment: .leading, spacing: ChipsLayout.tabCaptionGap * scale) {
+            HStack(spacing: 3 * scale) {
+                Image(systemName: captionIcon)
+                    .font(.system(size: 7 * scale, weight: .semibold))
+                Text(caption.uppercased())
+                    .font(.system(size: 8 * scale, weight: .semibold))
+                    .tracking(0.5)
+            }
+            .foregroundColor(.white.opacity(0.32))
+            .frame(height: ChipsLayout.tabCaptionHeight * scale)
+
+            HStack(spacing: 0) { tabs() }
+        }
     }
 
     @ViewBuilder
@@ -426,10 +510,10 @@ private struct ChipsColumnView: View {
                         )
                 )
                 // Visible chip stays 34×24, but the tappable area fills the
-                // full tab-bar height and a wider span so the buttons are
-                // easier to hit. Leading-align the visible chip so the first
-                // icon stays flush with the chip rows below (no 5px drift).
-                .frame(width: 44 * scale, height: ChipsLayout.tabBarHeight * scale,
+                // icon-row height and a wider span so the buttons are easier to
+                // hit. Leading-align the visible chip so the first icon stays
+                // flush with the chip rows below (no 5px drift).
+                .frame(width: 44 * scale, height: ChipsLayout.tabIconRowHeight * scale,
                        alignment: .leading)
                 .contentShape(Rectangle())
         }
@@ -442,8 +526,14 @@ private struct ChipsColumnView: View {
             VStack(alignment: .leading, spacing: ChipsLayout.rowSpacing * scale) {
                 switch vm.chipsTab {
                 case .suggested:
-                    ForEach(actions) { action in
-                        ActionChip(title: action.rawValue, isLoading: false) { runAction(action) }
+                    if actions.isEmpty {
+                        emptyHint("No AI actions for this file type — use Utilities or “Open in”.")
+                    } else {
+                        // Pills (ActionChip) for the AI-insight suggestions, matching the
+                        // History / Custom tabs. (Utilities keep the menu-row look.)
+                        ForEach(actions) { action in
+                            ActionChip(title: action.rawValue, isLoading: false) { runAction(action) }
+                        }
                     }
                 case .history:
                     if store.history.isEmpty {
@@ -458,11 +548,86 @@ private struct ChipsColumnView: View {
                         ActionChip(title: p, isLoading: false) { runCustomPromptText(p) }
                     }
                     customAddRow
+                case .utilities:
+                    // Pillar 2: file-utility actions as chips (convert/rename/move/…),
+                    // type-gated to the dropped file. Tapping runs the FileTools engine
+                    // and confirms the macOS-native way (Finder reveal / NSAlert).
+                    ForEach(utilityTools) { tool in
+                        MenuActionRow(title: tool.title, systemImage: tool.systemImage,
+                                      isLoading: runningTool == tool) {
+                            // One media op at a time; sync utilities are instant.
+                            guard runningTool == nil else { return }
+                            if tool.isAsync {
+                                runningTool = tool
+                                Task {
+                                    await FileToolActions.performAsync(
+                                        tool, fileURL: fileURL, sessionFiles: vm.sessionFileURLs)
+                                    runningTool = nil
+                                }
+                            } else {
+                                FileToolActions.perform(tool, fileURL: fileURL,
+                                                        sessionFiles: vm.sessionFileURLs)
+                            }
+                        }
+                    }
                 }
             }
             .frame(maxWidth: .infinity, alignment: .leading)
+            // Report scroll offset (content top relative to the viewport) + content height
+            // so the custom scroll indicator can size & place its knob.
+            .background(
+                GeometryReader { geo in
+                    Color.clear.preference(
+                        key: ChipsScrollMetricsKey.self,
+                        value: ChipsScrollMetrics(
+                            offset: geo.frame(in: .named("chipsScroll")).minY,
+                            contentHeight: geo.size.height))
+                }
+            )
         }
+        .coordinateSpace(name: "chipsScroll")
         .frame(height: ChipsLayout.contentHeight(rows: currentRowCount) * scale, alignment: .top)
+        // Fade the bottom edge when the list is taller than the visible region, so it
+        // reads as "scroll down for more". No fade when everything fits (mask all-opaque).
+        .mask(
+            VStack(spacing: 0) {
+                Rectangle().fill(.white)
+                LinearGradient(
+                    colors: [.white, hasTabOverflow ? .clear : .white],
+                    startPoint: .top, endPoint: .bottom
+                )
+                .frame(height: 22 * scale)
+            }
+        )
+        // Custom scroll indicator — drawn AFTER the fade mask so it isn't faded out.
+        // Thin + dim by design (the native macOS scroller can't be restyled this way).
+        .overlay(alignment: .topTrailing) { scrollIndicator }
+        .onPreferenceChange(ChipsScrollMetricsKey.self) { scrollMetrics = $0 }
+    }
+
+    /// A slim, dim scroll-position knob shown only when the tab list overflows. Geometry
+    /// comes from `scrollMetrics` (offset + content height) vs. the fixed viewport height.
+    @ViewBuilder private var scrollIndicator: some View {
+        let viewportH = ChipsLayout.contentHeight(rows: currentRowCount) * scale
+        let contentH  = scrollMetrics.contentHeight
+        if contentH > viewportH + 1 {
+            let knobH      = max(16 * scale, viewportH * (viewportH / contentH))
+            let scrollable = contentH - viewportH
+            let progress   = min(1, max(0, -scrollMetrics.offset / scrollable))
+            let knobY      = progress * (viewportH - knobH)
+            Capsule(style: .continuous)
+                .fill(Color.white.opacity(0.22))
+                .frame(width: 2.5 * scale, height: knobH)
+                .padding(.trailing, 2 * scale)
+                .offset(y: knobY)
+                .allowsHitTesting(false)
+        }
+    }
+
+    /// True when the active tab has more rows than the visible region can show, i.e. the
+    /// content region is scrolling (`contentHeight` clamps at `maxVisibleRows`).
+    private var hasTabOverflow: Bool {
+        currentRowCount > ChipsLayout.maxVisibleRows
     }
 
     private func emptyHint(_ text: String) -> some View {
@@ -590,8 +755,9 @@ private struct TwoColumnView: View {
 
             VStack(alignment: .leading, spacing: 6 * scale) {
                 ForEach(FileInspector.suggestedActions(for: fileURL)) { action in
-                    ActionChip(
+                    MenuActionRow(
                         title: action.rawValue,
+                        systemImage: action.icon,
                         isLoading: {
                             if case .loading(_, let a) = vm.stage { return a == action }
                             return false
@@ -601,6 +767,12 @@ private struct TwoColumnView: View {
             }
 
             Spacer(minLength: 0)
+
+            // Pillar 1: the same "Open in" favorite-app launch row as the chips stage,
+            // pinned to the bottom-left corner. Identical ToolRow → identical styling,
+            // including the trailing "+" add button. Option+1…9 are functional here too
+            // (the tool-hotkey monitor runs in both chips and result stages).
+            ToolRow()
         }
         .padding(15 * scale)
     }
@@ -665,7 +837,7 @@ private struct TwoColumnView: View {
                 if vm.isFollowupsExpanded {
                     VStack(alignment: .leading, spacing: 6 * scale) {
                         ForEach(followUpActions) { action in
-                            ActionChip(title: action.rawValue, isLoading: false) {
+                            MenuActionRow(title: action.rawValue, systemImage: action.icon) {
                                 runAction(action)
                             }
                         }
@@ -849,6 +1021,232 @@ private struct TwoColumnView: View {
     }
 }
 
+// MARK: - Utility result stage (Pillar 2 — "second result stage")
+
+/// Shown after a file utility produces a NEW file (Stage.fileResult): the output file's
+/// details (with a size delta vs the source) sit above the original file's details, both
+/// as downward-expanded file pills, plus Reveal-in-Finder / Quick Look / ← back actions.
+/// Single column (~500 pt wide). Facts are gathered off-main via FileFacts.gather.
+private struct FileResultView: View {
+    let original: URL
+    let output: URL
+    let tool: FileTool
+    @ObservedObject private var vm = OverlayViewModel.shared
+    @Environment(\.uiScale) private var scale
+
+    @State private var outFacts:  FileFacts.Facts?
+    @State private var origFacts: FileFacts.Facts?
+
+    /// Output-vs-original size delta ("73% smaller"), once both facts are loaded.
+    private var deltaText: String? {
+        guard let o = outFacts, let s = origFacts else { return nil }
+        return FileFacts.deltaText(output: o.sizeBytes, original: s.sizeBytes)
+    }
+
+    /// Re-gather if the pair changes (e.g. a session URL remap renames the files).
+    private var pairKey: String { output.path + "→" + original.path }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 12 * scale) {
+            // ── Header: past-tense tool title + close ────────────────────────
+            HStack(spacing: 8 * scale) {
+                Image(systemName: tool.systemImage)
+                    .font(.system(size: 13 * scale, weight: .semibold))
+                    .foregroundColor(.white.opacity(0.85))
+                Text(tool.resultTitle)
+                    .font(.system(size: 14 * scale, weight: .semibold))
+                    .foregroundColor(.white)
+                    .lineLimit(1)
+                Spacer(minLength: 0)
+                CloseButton()
+            }
+
+            // ── Output (the new file) ────────────────────────────────────────
+            sectionCaption("RESULT")
+            ExpandedFilePill(url: output, facts: outFacts, badge: deltaText, accent: true)
+
+            // ── Actions ──────────────────────────────────────────────────────
+            HStack(spacing: 8 * scale) {
+                FileResultActionButton(systemImage: "folder", title: "Reveal in Finder") {
+                    FileTools.revealInFinder([output])
+                }
+                FileResultActionButton(systemImage: "eye", title: "Quick Look") {
+                    QuickLookController.shared.present(urls: [output], current: 0)
+                }
+                Spacer(minLength: 0)
+                FileResultActionButton(systemImage: "arrow.left", title: "Back") {
+                    withAnimation(.spring(response: 0.32, dampingFraction: 1.0)) {
+                        vm.returnToChips()
+                    }
+                }
+            }
+
+            // ── Original (the source) ────────────────────────────────────────
+            sectionCaption("ORIGINAL")
+            ExpandedFilePill(url: original, facts: origFacts, badge: nil, accent: false)
+
+            Spacer(minLength: 0)
+        }
+        .padding(16 * scale)
+        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
+        .task(id: pairKey) {
+            outFacts  = await FileFacts.gather(output)
+            origFacts = await FileFacts.gather(original)
+        }
+    }
+
+    private func sectionCaption(_ text: String) -> some View {
+        Text(text)
+            .font(.system(size: 10 * scale, weight: .semibold))
+            .tracking(0.6)
+            .foregroundColor(.white.opacity(0.35))
+    }
+}
+
+/// A file pill expanded downward into a details card: icon + name + size (with an
+/// optional delta badge) on top, then a key/value detail grid (kind, dimensions /
+/// pages / duration / item count). Draggable out + click-to-Quick-Look, matching the
+/// header file pill. `facts == nil` renders just the header until gathering finishes.
+private struct ExpandedFilePill: View {
+    let url: URL
+    let facts: FileFacts.Facts?
+    /// e.g. "73% smaller" — tinted capsule beside the size (output pill only).
+    let badge: String?
+    /// Accent = the produced file (brighter fill + accent border); false = the source.
+    let accent: Bool
+    @ObservedObject private var vm = OverlayViewModel.shared
+    @Environment(\.uiScale) private var scale
+
+    @State private var fileIcon = NSImage(named: NSImage.multipleDocumentsName) ?? NSImage()
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 9 * scale) {
+            // Header: icon + name + size(+delta) + share
+            HStack(spacing: 9 * scale) {
+                Image(nsImage: fileIcon)
+                    .resizable()
+                    .interpolation(.high)
+                    .frame(width: 30 * scale, height: 30 * scale)
+
+                VStack(alignment: .leading, spacing: 2 * scale) {
+                    Text(url.lastPathComponent)
+                        .font(.system(size: 12.5 * scale, weight: .semibold))
+                        .foregroundColor(.white)
+                        .lineLimit(1)
+                        .truncationMode(.middle)
+                    HStack(spacing: 6 * scale) {
+                        Text(facts?.sizeText ?? "—")
+                            .font(.system(size: 10.5 * scale, weight: .medium))
+                            .foregroundColor(.white.opacity(0.50))
+                        if let badge {
+                            Text(badge)
+                                .font(.system(size: 9.5 * scale, weight: .bold))
+                                .foregroundColor(.white)
+                                .padding(.horizontal, 6 * scale)
+                                .padding(.vertical, 1.5 * scale)
+                                .background(Color.accentColor.opacity(0.80))
+                                .clipShape(Capsule(style: .continuous))
+                        }
+                    }
+                }
+
+                Spacer(minLength: 0)
+                ShareButton(fileURL: url)
+            }
+
+            // Detail grid (kind + type-specific facts)
+            if !detailRows.isEmpty {
+                Rectangle()
+                    .fill(Color.white.opacity(0.08))
+                    .frame(height: 0.75)
+                VStack(alignment: .leading, spacing: 5 * scale) {
+                    ForEach(detailRows, id: \.0) { row in
+                        HStack(spacing: 0) {
+                            Text(row.0)
+                                .font(.system(size: 10.5 * scale, weight: .medium))
+                                .foregroundColor(.white.opacity(0.40))
+                                .frame(width: 92 * scale, alignment: .leading)
+                            Text(row.1)
+                                .font(.system(size: 10.5 * scale, weight: .medium))
+                                .foregroundColor(.white.opacity(0.80))
+                                .lineLimit(1)
+                                .truncationMode(.middle)
+                            Spacer(minLength: 0)
+                        }
+                    }
+                }
+            }
+        }
+        .padding(12 * scale)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background(
+            RoundedRectangle(cornerRadius: 12 * scale, style: .continuous)
+                .fill(Color.white.opacity(accent ? 0.07 : 0.04))
+                .overlay(
+                    RoundedRectangle(cornerRadius: 12 * scale, style: .continuous)
+                        .strokeBorder(accent ? Color.accentColor.opacity(0.35)
+                                             : Color.white.opacity(0.12),
+                                      lineWidth: 0.75)
+                )
+        )
+        .contentShape(Rectangle())
+        .onTapGesture { QuickLookController.shared.present(urls: [url], current: 0) }
+        .onDrag {
+            vm.isDraggingOut = true
+            return NSItemProvider(object: url as NSURL)
+        }
+        .help(url.lastPathComponent)
+        .onAppear {
+            Task { @MainActor in fileIcon = NSWorkspace.shared.icon(forFile: url.path) }
+        }
+    }
+
+    /// Type-specific detail rows derived from the gathered facts.
+    private var detailRows: [(String, String)] {
+        guard let f = facts else { return [] }
+        var rows: [(String, String)] = [("Kind", f.kind)]
+        if let d = f.dimensions { rows.append(("Dimensions", d)) }
+        if let p = f.pageCount  { rows.append(("Pages", p.formatted())) }
+        if let d = f.duration   { rows.append(("Duration", d)) }
+        if let n = f.itemCount  { rows.append(("Items", n.formatted())) }
+        return rows
+    }
+}
+
+/// Compact labelled action button for the utility result stage (Reveal / Quick Look / Back).
+private struct FileResultActionButton: View {
+    let systemImage: String
+    let title: String
+    let action: () -> Void
+    @State private var isHovered = false
+    @Environment(\.uiScale) private var scale
+
+    var body: some View {
+        Button(action: action) {
+            HStack(spacing: 5 * scale) {
+                Image(systemName: systemImage)
+                    .font(.system(size: 10 * scale, weight: .semibold))
+                Text(title)
+                    .font(.system(size: 11 * scale, weight: .medium))
+            }
+            .foregroundColor(.white.opacity(isHovered ? 1.0 : 0.80))
+            .padding(.horizontal, 10 * scale)
+            .padding(.vertical, 6 * scale)
+            .background(
+                RoundedRectangle(cornerRadius: 8 * scale, style: .continuous)
+                    .fill(Color.white.opacity(isHovered ? 0.12 : 0.06))
+                    .overlay(
+                        RoundedRectangle(cornerRadius: 8 * scale, style: .continuous)
+                            .strokeBorder(Color.white.opacity(isHovered ? 0.22 : 0.12), lineWidth: 0.5)
+                    )
+            )
+        }
+        .buttonStyle(.plain)
+        .onHover { isHovered = $0 }
+        .animation(.easeInOut(duration: 0.12), value: isHovered)
+    }
+}
+
 // MARK: - Chat transcript rows
 
 /// One transcript line. User prompts render as a right-aligned tinted capsule;
@@ -927,7 +1325,9 @@ private struct FileHeaderView: View {
             Spacer(minLength: 0)
 
             // ── Collapse suggestions toggle (chips stage only) ───────────────
-            if vm.stage.tag == 1 {
+            // Hidden for media: there's no prompt field to collapse down to, so the
+            // toggle would have nothing to do.
+            if vm.stage.tag == 1, !FileInspector.isMediaFile(fileURL) {
                 Button {
                     // Height reflow stays monotonic (no Y-jump). The elastic
                     // overbounce is the keyframeAnimator on the card (triggered by
@@ -1161,26 +1561,33 @@ private struct SingleFilePill: View {
 
     var body: some View {
         HStack(spacing: 8 * scale) {
-            Image(nsImage: fileIcon)
-                .resizable()
-                .interpolation(.high)
-                .frame(width: 24 * scale, height: 24 * scale)
+            // Icon + name = a click target that opens Quick Look (the pill's drag
+            // still works — a drag needs movement, a bare click previews).
+            HStack(spacing: 8 * scale) {
+                Image(nsImage: fileIcon)
+                    .resizable()
+                    .interpolation(.high)
+                    .frame(width: 24 * scale, height: 24 * scale)
 
-            VStack(alignment: .leading, spacing: 1 * scale) {
-                Text(fileURL.lastPathComponent)
-                    .font(.system(size: 12 * scale, weight: .semibold))
-                    .foregroundColor(.white)
-                    .lineLimit(1)
-                    .truncationMode(.middle)
-                Text("Drag to move")
-                    .font(.system(size: 9 * scale, weight: .regular))
-                    .foregroundColor(.white.opacity(0.35))
-                    .lineLimit(1)
+                VStack(alignment: .leading, spacing: 1 * scale) {
+                    Text(fileURL.lastPathComponent)
+                        .font(.system(size: 12 * scale, weight: .semibold))
+                        .foregroundColor(.white)
+                        .lineLimit(1)
+                        .truncationMode(.middle)
+                    Text("Click to preview · drag to move")
+                        .font(.system(size: 9 * scale, weight: .regular))
+                        .foregroundColor(.white.opacity(0.35))
+                        .lineLimit(1)
+                }
+                .fixedSize(horizontal: false, vertical: true)
             }
-            .fixedSize(horizontal: false, vertical: true)
+            .contentShape(Rectangle())
+            .onTapGesture { QuickLookController.shared.present(urls: vm.sessionFileURLs, current: 0) }
 
-            // ••• now owns Share too (see FileToolsButton) — no separate share button.
-            FileToolsButton(fileURL: fileURL)
+            // Share the file via the native macOS share sheet. File utilities now
+            // live in the chips-stage "Utilities" tab, not behind a ••• menu here.
+            ShareButton(fileURL: fileURL)
         }
         .padding(.horizontal, 9 * scale)
         .padding(.vertical, 7 * scale)
@@ -1267,10 +1674,10 @@ private struct FilePill: View {
                             .strokeBorder(Color.white.opacity(0.13), lineWidth: 0.5)
                     )
             )
-            // ••• file-tools badge — top-leading corner, visible on hover
+            // Share badge — top-leading corner, visible on hover
             .overlay(alignment: .topLeading) {
                 if isHovering {
-                    FileToolsButton(fileURL: fileURL, compact: true)
+                    ShareButton(fileURL: fileURL, compact: true)
                         .offset(x: -4 * scale, y: -4 * scale)
                         .transition(.scale(scale: 0.5).combined(with: .opacity)
                             .animation(.spring(response: 0.20, dampingFraction: 0.68)))
@@ -1296,6 +1703,13 @@ private struct FilePill: View {
             .onDrag {
                 vm.isDraggingOut = true
                 return NSItemProvider(object: fileURL as NSURL)
+            }
+            // Bare click → Quick Look this file (the carousel's other files stay
+            // reachable via the panel's ◀ ▶). Drag still moves the file out.
+            .onTapGesture {
+                let urls = vm.sessionFileURLs
+                QuickLookController.shared.present(urls: urls,
+                                                   current: urls.firstIndex(of: fileURL) ?? 0)
             }
             .onHover { isHovering = $0 }
             .animation(.easeInOut(duration: 0.12), value: isHovering)
@@ -1352,12 +1766,15 @@ private struct FilePill: View {
 private struct ShareButton: View {
     /// All files to share. Pass a single-element array for single-file sessions.
     let fileURLs: [URL]
+    /// Compact = small dark corner badge (icon-only multi-file pills). Default =
+    /// 22×22 glass circle (single-file pill), matching the header controls.
+    var compact: Bool = false
     @State private var isHovered = false
     @Environment(\.uiScale) private var scale
 
     /// Convenience init for the common single-file case.
-    init(fileURL: URL) { fileURLs = [fileURL] }
-    init(fileURLs: [URL]) { self.fileURLs = fileURLs }
+    init(fileURL: URL, compact: Bool = false) { fileURLs = [fileURL]; self.compact = compact }
+    init(fileURLs: [URL], compact: Bool = false) { self.fileURLs = fileURLs; self.compact = compact }
 
     private var tooltip: String {
         fileURLs.count == 1 ? "Share file" : "Share \(fileURLs.count) files"
@@ -1365,20 +1782,29 @@ private struct ShareButton: View {
 
     var body: some View {
         ShareLink(items: fileURLs) {
-            Image(systemName: "square.and.arrow.up")
-                .font(.system(size: 8 * scale, weight: .semibold))
-                .foregroundColor(.white.opacity(isHovered ? 1.0 : 0.60))
-                .frame(width: 22 * scale, height: 22 * scale)
-                .background(
-                    Circle()
-                        .fill(Color.white.opacity(isHovered ? 0.12 : 0.06))
-                        .overlay(
-                            Circle().strokeBorder(
-                                Color.white.opacity(isHovered ? 0.22 : 0.12),
-                                lineWidth: 0.5
+            if compact {
+                Image(systemName: "square.and.arrow.up")
+                    .font(.system(size: 6 * scale, weight: .bold))
+                    .foregroundColor(.white)
+                    .frame(width: 13 * scale, height: 13 * scale)
+                    .background(Circle().fill(Color(white: 0.20).opacity(0.95)))
+                    .overlay(Circle().strokeBorder(Color.white.opacity(0.18), lineWidth: 0.5))
+            } else {
+                Image(systemName: "square.and.arrow.up")
+                    .font(.system(size: 8 * scale, weight: .semibold))
+                    .foregroundColor(.white.opacity(isHovered ? 1.0 : 0.60))
+                    .frame(width: 22 * scale, height: 22 * scale)
+                    .background(
+                        Circle()
+                            .fill(Color.white.opacity(isHovered ? 0.12 : 0.06))
+                            .overlay(
+                                Circle().strokeBorder(
+                                    Color.white.opacity(isHovered ? 0.22 : 0.12),
+                                    lineWidth: 0.5
+                                )
                             )
-                        )
-                )
+                    )
+            }
         }
         .buttonStyle(.plain)
         .fixedSize()
@@ -1630,6 +2056,66 @@ private struct PromptField: View {
     }
 }
 
+// MARK: - Menu action row
+//
+// Apple-menu styling for ACTIONS (AI insights + file utilities): a full-width row with a
+// leading SF Symbol + label and a soft translucent-white highlight on hover, like a native
+// macOS menu item. Pills (ActionChip) are reserved for typed PROMPTS (History / Custom).
+// Kept within the ChipsLayout.rowStride budget so the chips-stage window-height math is
+// unchanged — no AppDelegate.sizeForStage edit needed.
+
+struct MenuActionRow: View {
+    let title: String
+    let systemImage: String
+    var isLoading: Bool = false
+    let action: () -> Void
+
+    @State private var isHovered = false
+    @Environment(\.uiScale) private var scale
+
+    var body: some View {
+        Button(action: action) {
+            HStack(spacing: 9 * scale) {
+                ZStack {
+                    if isLoading {
+                        ProgressView()
+                            .progressViewStyle(.circular)
+                            .scaleEffect(0.5)
+                            .tint(.white)
+                    } else {
+                        Image(systemName: systemImage)
+                            .font(.system(size: 12 * scale, weight: .medium))
+                    }
+                }
+                .frame(width: 16 * scale, height: 16 * scale)
+                .foregroundColor(.white.opacity(0.70))
+
+                Text(title)
+                    .font(.system(size: 12 * scale, weight: .medium))
+                    .foregroundColor(.white)
+                    .lineLimit(1)
+                    .truncationMode(.tail)
+
+                Spacer(minLength: 0)
+            }
+            .padding(.horizontal, 8 * scale)
+            .padding(.vertical, 6 * scale)
+            .frame(maxWidth: .infinity, alignment: .leading)
+            // Full-row rounded highlight — the macOS menu "selection" look, neutral
+            // white so it sits on the dark card glass without competing for attention.
+            .background(
+                RoundedRectangle(cornerRadius: 7 * scale, style: .continuous)
+                    .fill(Color.white.opacity(isHovered ? 0.10 : 0.0))
+            )
+            .contentShape(RoundedRectangle(cornerRadius: 7 * scale, style: .continuous))
+        }
+        .buttonStyle(.plain)
+        .animation(.easeOut(duration: 0.12), value: isHovered)
+        .onHover { isHovered = $0 }
+        .disabled(isLoading)
+    }
+}
+
 // MARK: - Action chip
 
 struct ActionChip: View {
@@ -1743,6 +2229,15 @@ private func sendTurn(provider: any AIProvider,
 
     let additionalURLs = vm.additionalFileURLs
 
+    // Resolve the provider FRESH for this turn. The `provider` passed into OverlayView
+    // is captured once when the overlay window is first built, and that window is reused
+    // for the whole app lifetime (never recreated — see the window invariants). So after
+    // the user switches tier (BYOK ↔ AI Drop Free / Pro) the baked-in provider goes
+    // STALE: requests keep routing through whatever tier was active at first launch.
+    // Re-resolving here makes a switch take effect on the next request — no relaunch —
+    // and is why "AI Drop Free" requests were still hitting the stored BYOK key (flash).
+    let liveProvider = resolveProvider()
+
     Task {
         do {
             // Extract the document ONCE per session; reuse for every turn.
@@ -1769,8 +2264,8 @@ private func sendTurn(provider: any AIProvider,
             // `forceTier` (manual "Go deeper") overrides the tier, keeping the ceiling.
             let basePlan = typedPrompt.map(RoutingPlan.forCustomPrompt) ?? action.routing
             let plan = forceTier.map { basePlan.with(tier: $0) } ?? basePlan
-            let text = try await provider.reply(messages: turns, imageURL: base.imageURL,
-                                                plan: plan)
+            let text = try await liveProvider.reply(messages: turns, imageURL: base.imageURL,
+                                                    plan: plan)
 
             vm.contentTruncated = base.truncated
             vm.isAwaitingReply  = false
@@ -1855,6 +2350,11 @@ private func buildMultiFileContent(
 
     // ── Single non-image ──────────────────────────────────────────────────────
     if allURLs.count == 1 {
+        // Media has no AI path in the UI; guard here too so a stray call never spends
+        // tokens decoding binary audio/video as Latin-1 text.
+        if FileInspector.isMediaFile(allURLs[0]) {
+            throw FileContentExtractor.ExtractionError.unsupportedFileType
+        }
         let result = try await FileContentExtractor.extract(from: allURLs[0], limit: charLimit)
         return (result.text, nil, result.truncated)
     }
@@ -1864,7 +2364,10 @@ private func buildMultiFileContent(
     var anyTruncated = false
     for url in allURLs {
         let body: String
-        if FileInspector.isImageFile(url) {
+        if FileInspector.isMediaFile(url) {
+            // Never feed raw audio/video to the model — name it and move on.
+            body = "[Media: \(url.lastPathComponent) — audio/video is not analysed]"
+        } else if FileInspector.isImageFile(url) {
             // Vision analysis is only available for single-image sessions;
             // in multi-file mode describe the image by name / context.
             body = "[Image: \(url.lastPathComponent) — visual description not available in multi-file mode]"
@@ -2080,9 +2583,12 @@ struct OverlayPrewarmView: View {
     var body: some View {
         VStack(alignment: .leading, spacing: 10) {
             FilePillsRow(primaryURL: dummyURL)
+            // Warm BOTH chip leaves the real card uses: MenuActionRow (AI actions /
+            // utilities) and ActionChip (typed-prompt pills).
             ForEach(["Summarise", "Key points", "Explain"], id: \.self) { title in
-                ActionChip(title: title, isLoading: false, action: {})
+                MenuActionRow(title: title, systemImage: "sparkles", action: {})
             }
+            ActionChip(title: "Saved prompt", isLoading: false, action: {})
             PromptField(text: .constant(""), onSubmit: {})
             MarkdownText(source: "**Warming up** the renderer…")
         }

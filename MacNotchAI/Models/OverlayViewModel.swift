@@ -43,7 +43,7 @@ class OverlayViewModel: ObservableObject {
     /// Custom = user-curated prompts. Observed by AppDelegate so the chips window
     /// resizes to the active tab's row count.
     enum ChipsTab: Int, CaseIterable {
-        case suggested, history, custom
+        case suggested, history, custom, utilities
     }
 
     enum Stage {
@@ -52,6 +52,10 @@ class OverlayViewModel: ObservableObject {
         case loading(url: URL, action: AIAction)
         case result(url: URL, action: AIAction, text: String)
         case error(url: URL, message: String)
+        /// "Second result stage" (Pillar 2): a file utility produced `output` from
+        /// `original`. Shows both files' details side-by-side with a size delta and a
+        /// Reveal-in-Finder action. `output` may be a folder (split/pdf→images).
+        case fileResult(original: URL, output: URL, tool: FileTool)
 
         var showsRightColumn: Bool {
             switch self {
@@ -63,7 +67,8 @@ class OverlayViewModel: ObservableObject {
         var fileURL: URL? {
             switch self {
             case .chips(let u, _), .loading(let u, _),
-                 .result(let u, _, _), .error(let u, _): return u
+                 .result(let u, _, _), .error(let u, _),
+                 .fileResult(let u, _, _): return u
             default: return nil
             }
         }
@@ -76,6 +81,7 @@ class OverlayViewModel: ObservableObject {
             case .loading:        return 2
             case .result:         return 3
             case .error:          return 4
+            case .fileResult:     return 5
             }
         }
     }
@@ -182,6 +188,14 @@ class OverlayViewModel: ObservableObject {
         didSet { baseContext = nil }
     }
 
+    /// Every file in the current session — primary (the stage URL) first, then any
+    /// files added via "Add to session". Empty when nothing is staged. Used by the
+    /// tool launch row to open the whole batch in a favorite app.
+    var sessionFileURLs: [URL] {
+        guard let primary = stage.fileURL else { return [] }
+        return [primary] + additionalFileURLs
+    }
+
     // ── Jelly wobble ─────────────────────────────────────────────────────────
     // Applied to the pill scaleEffect in OverlayView (outside clipShape so it
     // overflows into the transparent canvas without hitting NSHostingView clip).
@@ -233,7 +247,9 @@ class OverlayViewModel: ObservableObject {
         minimizedSnapshot = nil
         hasMinimizedSession = false
         additionalFileURLs = []   // fresh drop clears any previously added files
-        chipsTab = .suggested     // always open a new file on its suggested actions
+        // Media (video/audio) has no AI actions — open it straight on Utilities so the
+        // first thing shown is useful, not an empty Suggested list.
+        chipsTab = FileInspector.isMediaFile(url) ? .utilities : .suggested
         // Fresh drop — previous session's cached result no longer relevant.
         cachedResult = nil
         // Fresh drop re-anchors the window at the notch; discard any manual nudge.
@@ -269,7 +285,8 @@ class OverlayViewModel: ObservableObject {
 
         minimizedSnapshot = nil
         hasMinimizedSession = false
-        chipsTab = .suggested
+        // Media primary → open on Utilities (no AI actions for video/audio).
+        chipsTab = FileInspector.isMediaFile(primary) ? .utilities : .suggested
         cachedResult = nil
         userDragOffset = .zero
         contentTruncated = false
@@ -297,6 +314,17 @@ class OverlayViewModel: ObservableObject {
         chipsTab = .suggested
         stage = .chips(url: url,
                        actions: FileInspector.suggestedActions(forAll: [url] + additionalFileURLs))
+    }
+
+    /// Return to the chips stage from the file-utility result stage. Rebuilds the
+    /// suggested actions for the whole session so the user can run another tool or an
+    /// AI action on the same file(s). The output file is not added to the session.
+    func returnToChips() {
+        guard let primary = stage.fileURL else { return }
+        cachedResult = nil
+        stage = .chips(url: primary,
+                       actions: FileInspector.suggestedActions(forAll: [primary] + additionalFileURLs))
+        customPrompt = ""
     }
 
     /// Navigate back to the chips stage while keeping the current result cached
@@ -383,6 +411,8 @@ class OverlayViewModel: ObservableObject {
             stage = .result(url: remap(u), action: a, text: t)
         case .error(let u, let m):
             stage = .error(url: remap(u), message: m)
+        case .fileResult(let o, let out, let t):
+            stage = .fileResult(original: remap(o), output: remap(out), tool: t)
         }
 
         if let cached = cachedResult {
@@ -400,6 +430,8 @@ class OverlayViewModel: ObservableObject {
             case .loading(let u, let a):       snap.stage = .loading(url: remap(u), action: a)
             case .result(let u, let a, let t): snap.stage = .result(url: remap(u), action: a, text: t)
             case .error(let u, let m):         snap.stage = .error(url: remap(u), message: m)
+            case .fileResult(let o, let out, let t):
+                snap.stage = .fileResult(original: remap(o), output: remap(out), tool: t)
             case .waitingForDrop:              break
             }
             minimizedSnapshot = snap
@@ -454,8 +486,23 @@ class OverlayViewModel: ObservableObject {
 enum ChipsLayout {
     static let rowStride:    CGFloat = 36   // per-row height budget (chip + slack)
     static let rowSpacing:   CGFloat = 6
-    static let tabBarHeight: CGFloat = 28
     static let maxVisibleRows = 5           // beyond this the content region scrolls
+
+    // ── Tab bar: two captioned groups ("AI Insights" / "Utilities") ───────────
+    // The bar is a tiny caption row sitting above the row of tab-icon buttons.
+    // `tabBarHeight` is the FULL region (caption + gap + icons) — both the SwiftUI
+    // bar and AppDelegate.sizeForStage size off it, so they must stay in lock-step.
+    static let tabIconRowHeight: CGFloat = 28   // the icon buttons' row
+    static let tabCaptionHeight: CGFloat = 12   // the tiny group caption above them
+    static let tabCaptionGap:    CGFloat = 3    // caption → icons spacing
+    static let tabBarHeight: CGFloat = tabCaptionHeight + tabCaptionGap + tabIconRowHeight
+
+    /// Tool launch row ("Open in") shown below the chips when the user has favorites:
+    /// a small "OPEN IN" caption + a row of app icons. Empty state collapses to a
+    /// single muted hint line (`toolHintHeight`). Both are fixed so the SwiftUI
+    /// content (ToolRow) and the AppDelegate window-height calc stay in lock-step.
+    static let toolRowHeight:  CGFloat = 58   // populated: caption + icon row
+    static let toolHintHeight: CGFloat = 24   // empty: one muted line
 
     /// Height of the (scrollable) tab content region for `rows` rows.
     static func contentHeight(rows: Int) -> CGFloat {
@@ -466,11 +513,12 @@ enum ChipsLayout {
     /// Logical row count for a tab BEFORE clamping. History shows a 1-row empty
     /// placeholder; Custom always includes the trailing "+ add" row.
     static func rows(for tab: OverlayViewModel.ChipsTab,
-                     suggested: Int, history: Int, custom: Int) -> Int {
+                     suggested: Int, history: Int, custom: Int, utilities: Int) -> Int {
         switch tab {
         case .suggested: return max(suggested, 1)
         case .history:   return history == 0 ? 1 : history
         case .custom:    return custom + 1
+        case .utilities: return max(utilities, 1)
         }
     }
 }

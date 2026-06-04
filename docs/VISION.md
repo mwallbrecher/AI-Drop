@@ -41,11 +41,17 @@ launcher:
 
 ## 4. The feature pillars
 
-### Pillar 1 — "Open With," supercharged  ← the MVP
-Drop a file → a numbered row of **your** apps appears (`1 Figma · 2 Premiere · 3 Preview…`). Click or
-`Option+1…9` to open the file there. Muscle memory; zero filesystem hunting. Targets ranked by file
-type. Mechanism: `NSWorkspace.open(urls:withApplicationAt:…)` (trivial on a non-sandboxed app).
-**Tool list = manual favorites** (user picks apps + assigns hotkeys in Settings) — decided 2026-06-01.
+### Pillar 1 — "Open With," supercharged  ← the MVP  ✅ SHIPPED (2026-06-01)
+Drop a file → a numbered "Open in" row of **your** apps appears (`1 Figma · 2 Premiere · 3 Preview…`)
+inside the chips stage. Click or `Option+1…9` to open the file(s) there; the launched app comes forward
+and the notch session stays open (dismiss manually). Muscle memory; zero filesystem hunting.
+Mechanism: `NSWorkspace.open(_:withApplicationAt:configuration:)`
+(trivial on a non-sandboxed app). **Tool list = manual favorites** (user picks apps in Settings; numbers
+auto-assign 1…9 by order) — decided 2026-06-01.
+- Code: `Models/FavoriteToolsStore.swift` (store), `UI/ToolRow.swift` (the row),
+  Favorite-Tools section in `SettingsView`, and a chips-stage-scoped local `Option+1…9`
+  `NSEvent` monitor in `AppDelegate` (`startToolHotkeys`/`handleToolHotkey`).
+- Not yet: file-type ranking of the row (shows all favorites in user order), drag-reorder polish.
 
 ### Pillar 2 — File utilities (no app at all)
 The "tool" is a micro-action at the notch: convert (HEIC→JPG, MOV→MP4, docx→pdf), compress, resize,
@@ -73,8 +79,8 @@ Collect files from several Finder windows onto the notch, then run a **saved cha
 
 ## 6. Roadmap (build order)
 
-1. **Pillar 1 MVP** — favorite tools + drop-to-launch hotkeys + Settings. Smallest build that proves the
-   whole reframe. (Plan + checklist in `tasks/todo.md`.)
+1. **Pillar 1 MVP** ✅ — favorite tools + drop-to-launch `Option+1…9` hotkeys + Settings. Shipped
+   2026-06-01. Smallest build that proves the whole reframe.
 2. **Pillar 2** — file utilities (convert/compress/resize/OCR).
 3. **Pillar 4** — the first AI→tool bridge (highest differentiation).
 4. **Pillar 3 / 5** — destinations and saved workflows, as usage demands.

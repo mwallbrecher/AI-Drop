@@ -1,11 +1,14 @@
 import SwiftUI
 import AppKit
+import AVFoundation
+import UniformTypeIdentifiers
 
-// MARK: - File tools menu button
+// MARK: - File tools runner
 //
-// The ••• control on a file pill. Opens a SwiftUI Menu of type-gated FileTool items
-// (FileTool.tools(for:sessionFiles:)). Item actions run the FileTools engine and
-// confirm the result the macOS-native way:
+// Dispatch + native dialogs for the file-utility actions (FileTool). These used to
+// live behind the ••• menu on the file pill; that control is now a plain Share button
+// and the utilities surface as chips in the chips-stage "Utilities" tab. The tab calls
+// `FileToolActions.perform(_:fileURL:sessionFiles:)`; results confirm the macOS-native way:
 //   • new outputs (pdf→txt, stitch, image)  → revealed in Finder
 //   • rename / move                          → session URL remapped (pill updates live)
 //   • failures                               → NSAlert
@@ -13,94 +16,36 @@ import AppKit
 // proven to present correctly from the floating overlay panel (SwiftUI .alert can fail
 // to find a key window here). See tasks/lessons.md.
 
-struct FileToolsButton: View {
-    let fileURL: URL
-    /// Compact = small dark corner badge (icon-only multi-file pills). Default =
-    /// 22×22 glass circle matching ShareButton (single-file pill).
-    var compact: Bool = false
-    @ObservedObject private var vm = OverlayViewModel.shared
-    @Environment(\.uiScale) private var scale
-    @State private var isHovered = false
+@MainActor
+enum FileToolActions {
 
-    /// All files in the current session (primary + added), for Stitch gating.
-    private var sessionFiles: [URL] {
-        guard let primary = vm.stage.fileURL else { return [fileURL] }
-        return [primary] + vm.additionalFileURLs
-    }
-
-    private var tools: [FileTool] { FileTool.tools(for: fileURL, sessionFiles: sessionFiles) }
-
-    /// Stitch needs ≥ 2 PDFs in the session; otherwise the item shows greyed out
-    /// with a hover hint telling the user to drop a second PDF.
-    private var stitchEnabled: Bool {
+    /// Stitch needs ≥ 2 PDFs in the session.
+    static func stitchEnabled(sessionFiles: [URL]) -> Bool {
         sessionFiles.filter { $0.pathExtension.lowercased() == "pdf" }.count >= 2
     }
 
-    var body: some View {
-        Menu {
-            ForEach(tools) { tool in
-                if tool == .pdfToText || tool == .resizeImage {
-                    Divider()
-                }
-                Button { perform(tool) } label: {
-                    Label(tool.title, systemImage: tool.systemImage)
-                }
-                .disabled(tool == .stitchPDFs && !stitchEnabled)
-                .help(tool == .stitchPDFs
-                      ? (stitchEnabled ? "Merge the session’s PDFs into one"
-                                       : "Drop a second PDF to stitch them")
-                      : "")
-            }
-
-            Divider()
-
-            // Native macOS share sheet (NSSharingServicePicker) via ShareLink —
-            // full service list + extensions, not a hand-rolled subset.
-            ShareLink(item: fileURL) {
-                Label("Share…", systemImage: "square.and.arrow.up")
-            }
-        } label: {
-            if compact {
-                Image(systemName: "ellipsis")
-                    .font(.system(size: 6 * scale, weight: .bold))
-                    .foregroundColor(.white)
-                    .frame(width: 13 * scale, height: 13 * scale)
-                    .background(Circle().fill(Color(white: 0.20).opacity(0.95)))
-                    .overlay(Circle().strokeBorder(Color.white.opacity(0.18), lineWidth: 0.5))
-            } else {
-                Image(systemName: "ellipsis")
-                    .font(.system(size: 8 * scale, weight: .bold))
-                    .foregroundColor(.white.opacity(isHovered ? 1.0 : 0.60))
-                    .frame(width: 22 * scale, height: 22 * scale)
-                    .background(
-                        Circle()
-                            .fill(Color.white.opacity(isHovered ? 0.12 : 0.06))
-                            .overlay(
-                                Circle().strokeBorder(
-                                    Color.white.opacity(isHovered ? 0.22 : 0.12),
-                                    lineWidth: 0.5
-                                )
-                            )
-                    )
-            }
+    /// The utility actions to OFFER for `url`, given the session. Same as
+    /// `FileTool.tools` but with Stitch dropped when it can't run yet (chips have no
+    /// disabled state, so we hide it rather than show a dead row). The chips-stage row
+    /// count derives from this exact list, so the window height stays in sync.
+    static func utilityTools(for url: URL, sessionFiles: [URL]) -> [FileTool] {
+        var list = FileTool.tools(for: url, sessionFiles: sessionFiles)
+        if !stitchEnabled(sessionFiles: sessionFiles) {
+            list.removeAll { $0 == .stitchPDFs }
         }
-        .menuStyle(.borderlessButton)
-        .menuIndicator(.hidden)
-        .fixedSize()
-        .onHover { isHovered = $0 }
-        .animation(.easeInOut(duration: 0.12), value: isHovered)
-        .help("File tools")
+        return list
     }
 
     // MARK: - Dispatch
 
-    private func perform(_ tool: FileTool) {
+    static func perform(_ tool: FileTool, fileURL: URL, sessionFiles: [URL]) {
+        let vm = OverlayViewModel.shared
         switch tool {
         case .reveal:
             FileTools.revealInFinder([fileURL])
 
         case .rename:
-            guard let newName = Self.promptRename(current: fileURL) else { return }
+            guard let newName = promptRename(current: fileURL) else { return }
             run {
                 let newURL = try FileTools.rename(fileURL, to: newName)
                 vm.remapSessionURL(from: fileURL, to: newURL)
@@ -108,7 +53,7 @@ struct FileToolsButton: View {
             }
 
         case .move:
-            guard let folder = Self.promptMoveFolder(for: fileURL) else { return }
+            guard let folder = promptMoveFolder(for: fileURL) else { return }
             run {
                 let newURL = try FileTools.move(fileURL, to: folder)
                 vm.remapSessionURL(from: fileURL, to: newURL)
@@ -116,27 +61,142 @@ struct FileToolsButton: View {
             }
 
         case .pdfToText:
-            run { try FileTools.exportPDFText(fileURL) }
+            runFile(tool, original: fileURL) { try FileTools.exportPDFText(fileURL) }
+
+        case .pdfSplit:
+            runFile(tool, original: fileURL) { try FileTools.splitPDF(fileURL) }
+
+        case .pdfToImages:
+            runFile(tool, original: fileURL) { try FileTools.pdfToImages(fileURL) }
 
         case .stitchPDFs:
-            run { try FileTools.stitchPDFs(sessionFiles) }
+            runFile(tool, original: fileURL) { try FileTools.stitchPDFs(sessionFiles) }
+
+        case .convertToJPEG:
+            runFile(tool, original: fileURL) { try FileTools.convertImage(fileURL, to: .jpeg, ext: "jpg") }
+
+        case .stripEXIF:
+            runFile(tool, original: fileURL) { try FileTools.stripImageMetadata(fileURL) }
+
+        case .imagesToPDF:
+            runFile(tool, original: fileURL) { try FileTools.imagesToPDF(sessionFiles) }
 
         case .resizeImage:
-            guard let opts = Self.promptImageOptions() else { return }
-            run { try FileTools.resizeAndRecompressImage(
+            guard let opts = promptImageOptions() else { return }
+            runFile(tool, original: fileURL) { try FileTools.resizeAndRecompressImage(
                 fileURL, maxDimension: opts.maxDimension, quality: opts.quality) }
+
+        case .prettyJSON:
+            runFile(tool, original: fileURL) { try FileTools.prettyPrintJSON(fileURL) }
+
+        case .compress:
+            runFile(tool, original: fileURL) { try FileTools.compress(fileURL) }
+
+        // Text / code / data (batch 3) — synchronous, instant.
+        case .sortLines:
+            runFile(tool, original: fileURL) { try FileTools.sortLines(fileURL) }
+        case .dedupeLines:
+            runFile(tool, original: fileURL) { try FileTools.dedupeLines(fileURL) }
+        case .minifyJSON:
+            runFile(tool, original: fileURL) { try FileTools.minifyJSON(fileURL) }
+        case .csvToJSON:
+            runFile(tool, original: fileURL) { try FileTools.csvToJSON(fileURL) }
+        case .jsonToCSV:
+            runFile(tool, original: fileURL) { try FileTools.jsonToCSV(fileURL) }
+        case .base64Encode:
+            runFile(tool, original: fileURL) { try FileTools.base64Encode(fileURL) }
+        case .base64Decode:
+            runFile(tool, original: fileURL) { try FileTools.base64Decode(fileURL) }
+
+        // INFO ops — produce a value (not a file): show it with a Copy button.
+        case .countText:
+            runInfo(title: "Lines / Words / Characters") { try FileTools.countStats(fileURL) }
+        case .hashSHA256:
+            runInfo(title: "SHA-256 — \(fileURL.lastPathComponent)") { try FileTools.sha256(fileURL) }
+
+        // Media ops are async — they must go through `performAsync`, not here.
+        case .extractAudio, .transcribe, .videoToGIF, .extractFrame, .compressVideo,
+             .muteVideo, .convertToMP4, .convertToMOV, .convertToM4A:
+            assertionFailure("media tool \(tool) must be dispatched via performAsync")
+        }
+    }
+
+    /// Async dispatch for the media tools (AVFoundation / Speech). Reveals the sibling
+    /// output in Finder on success; failures surface as an NSAlert. The caller (chips
+    /// Utilities tab) shows a per-row spinner for the duration.
+    static func performAsync(_ tool: FileTool, fileURL: URL, sessionFiles: [URL]) async {
+        do {
+            let output: URL?
+            switch tool {
+            case .extractAudio:  output = try await MediaTools.extractAudio(fileURL)
+            case .transcribe:    output = try await MediaTools.transcribe(fileURL)
+            case .videoToGIF:    output = try await MediaTools.videoToGIF(fileURL)
+            case .extractFrame:  output = try await MediaTools.extractFrame(fileURL)
+            case .compressVideo: output = try await MediaTools.compressVideo(fileURL)
+            case .muteVideo:     output = try await MediaTools.muteVideo(fileURL)
+            case .convertToMP4:  output = try await MediaTools.convertVideo(fileURL, to: .mp4, ext: "mp4")
+            case .convertToMOV:  output = try await MediaTools.convertVideo(fileURL, to: .mov, ext: "mov")
+            case .convertToM4A:  output = try await MediaTools.convertAudio(fileURL)
+            default:             return   // non-async tools go through `perform`
+            }
+            if let output { presentFileResult(tool: tool, original: fileURL, output: output) }
+        } catch {
+            presentError(error)
         }
     }
 
     /// Runs a throwing op on the main thread. A returned URL is revealed in Finder;
     /// `nil` means "no output to reveal". Failures surface as an NSAlert.
-    private func run(_ op: () throws -> URL?) {
+    private static func run(_ op: () throws -> URL?) {
         do {
             if let output = try op() {
                 FileTools.revealInFinder([output])
             }
         } catch {
-            Self.presentError(error)
+            presentError(error)
+        }
+    }
+
+    /// Runs a file-PRODUCING op, then advances to the utility result stage
+    /// (Stage.fileResult) — Finder reveal + a side-by-side details card (output vs the
+    /// `original` source, with a size delta). For multi-file ops (stitch / images→PDF)
+    /// pass the primary file as `original`. Failures surface as an NSAlert.
+    private static func runFile(_ tool: FileTool, original: URL, _ op: () throws -> URL) {
+        do { presentFileResult(tool: tool, original: original, output: try op()) }
+        catch { presentError(error) }
+    }
+
+    /// Reveals `output` in Finder, then transitions the model to `.fileResult`. The
+    /// stage write is deferred one runloop tick and wrapped in `withAnimation` — writing
+    /// `stage` synchronously inside a layout pass re-enters the constraint solver and
+    /// aborts (the stage-write invariant). Shared by the sync and async dispatch paths.
+    static func presentFileResult(tool: FileTool, original: URL, output: URL) {
+        FileTools.revealInFinder([output])
+        let vm = OverlayViewModel.shared
+        DispatchQueue.main.async {
+            withAnimation(.spring(response: 0.34, dampingFraction: 0.9)) {
+                vm.stage = .fileResult(original: original, output: output, tool: tool)
+            }
+        }
+    }
+
+    /// Runs an op that returns a STRING (checksum, counts) and shows it in an alert with
+    /// a Copy button instead of writing a file. Failures surface as an NSAlert.
+    private static func runInfo(title: String, _ op: () throws -> String) {
+        do { presentInfo(title: title, value: try op()) }
+        catch { presentError(error) }
+    }
+
+    private static func presentInfo(title: String, value: String) {
+        let alert = NSAlert()
+        alert.messageText = title
+        alert.informativeText = value
+        alert.addButton(withTitle: "Copy")
+        alert.addButton(withTitle: "Done")
+        NSApp.activate(ignoringOtherApps: true)
+        if alert.runModal() == .alertFirstButtonReturn {
+            NSPasteboard.general.clearContents()
+            NSPasteboard.general.setString(value, forType: .string)
         }
     }
 

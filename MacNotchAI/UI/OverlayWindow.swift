@@ -1,4 +1,5 @@
 import AppKit
+import Quartz
 
 class OverlayWindow: NSPanel {
 
@@ -20,6 +21,27 @@ class OverlayWindow: NSPanel {
 
     override var canBecomeKey:  Bool { true }
     override var canBecomeMain: Bool { false }
+
+    // MARK: - Quick Look (QLPreviewPanelController)
+    //
+    // QLPreviewPanel walks the key window's responder chain looking for a controller.
+    // The overlay is `canBecomeKey`, so once it's made key (QuickLookController.present)
+    // these hooks let the shared panel preview the dropped session files. The data source
+    // is the QuickLookController singleton. Esc inside the panel is delivered to OUR app,
+    // so the global Esc dismiss monitor doesn't fire — the panel closes, the session stays.
+
+    override func acceptsPreviewPanelControl(_ panel: QLPreviewPanel!) -> Bool { true }
+
+    override func beginPreviewPanelControl(_ panel: QLPreviewPanel!) {
+        panel.dataSource = QuickLookController.shared
+        panel.delegate   = QuickLookController.shared
+        panel.currentPreviewItemIndex = QuickLookController.shared.currentIndex
+    }
+
+    override func endPreviewPanelControl(_ panel: QLPreviewPanel!) {
+        panel.dataSource = nil
+        panel.delegate   = nil
+    }
 
     // MARK: - Show / hide
 

@@ -5,7 +5,14 @@ import SwiftUI
 /// Drop detection is intentionally permissive — we always return .copy
 /// for valid file URLs and guard the actual state transition in
 /// performDragOperation. This prevents missed drops due to timing races.
-final class DroppableHostingView<Content: View>: NSHostingView<Content> {
+///
+/// NOTE: intentionally NON-generic (concrete `NSHostingView<OverlayView>`).
+/// A generic `NSHostingView` subclass crashes the Swift compiler's IRGen pass
+/// while emitting the implicit `deinit` under x86_64 + optimization (Release
+/// archive only — arm64 Debug is fine), aborting the notarization archive.
+/// Every call site already builds it with `rootView: OverlayView(...)`, so
+/// pinning Content to `OverlayView` costs nothing and sidesteps the bug.
+final class DroppableHostingView: NSHostingView<OverlayView> {
 
     // ── URL cache ─────────────────────────────────────────────────────────────
     // pasteboard.readObjects() can stall 150-300 ms in performDragOperation
@@ -19,7 +26,7 @@ final class DroppableHostingView<Content: View>: NSHostingView<Content> {
     // the pasteboard again at drop time.
     private var cachedDropURLs: [URL] = []
 
-    required init(rootView: Content) {
+    required init(rootView: OverlayView) {
         super.init(rootView: rootView)
         // Register all file drag flavours — modern + legacy fallback
         registerForDraggedTypes([

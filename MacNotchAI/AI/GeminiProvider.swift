@@ -8,13 +8,26 @@ final class GeminiProvider: AIProvider {
     let name = "Gemini"
     private let apiKey: String
     private let baseURL = "https://generativelanguage.googleapis.com/v1beta/openai/chat/completions"
-    private let model = "gemini-2.5-flash"
 
     init(apiKey: String) { self.apiKey = apiKey }
     var isAvailable: Bool { !apiKey.isEmpty }
 
+    /// Tier-aware model pick — BYOK applies the SAME cost discipline as the hosted
+    /// Worker (see ModelRouting): mechanical/bounded work (`.fast`) runs on the cheap
+    /// flash-lite; anything needing judgement (`.strong`) runs on flash. `.extraStrong`
+    /// is a hosted-Pro-only tier — BYOK never escalates to the top model (mirrors the
+    /// Worker's "free degrades extra→strong" rule and the no-escalation note in
+    /// OverlayView), so it also resolves to flash.
+    private func model(for tier: AITier) -> String {
+        switch tier {
+        case .fast:                   return "gemini-2.5-flash-lite"
+        case .strong, .extraStrong:   return "gemini-2.5-flash"
+        }
+    }
+
     func reply(messages: [ChatTurn], imageURL: URL?, plan: RoutingPlan) async throws -> String {
         guard isAvailable else { throw AIError.noAPIKey(provider: name) }
+        let model = model(for: plan.tier)
 
         var request = URLRequest(url: URL(string: baseURL)!)
         request.httpMethod = "POST"

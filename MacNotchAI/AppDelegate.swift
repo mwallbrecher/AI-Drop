@@ -1,4 +1,5 @@
 import AppKit
+import Carbon.HIToolbox
 import Combine
 import SwiftUI
 
@@ -6,12 +7,20 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private var overlayWindow: OverlayWindow?
     private var onboardingWindow: NSWindow?
     private var hotkeyPickerWindow: NSWindow?
+    private var settingsWindow: NSWindow?
     private var startupToastWindow: NSPanel?
     private var statusItem: NSStatusItem?         // menu-bar icon (replaces MenuBarExtra)
     private var cancellables = Set<AnyCancellable>()
     private var escapeMonitor: Any?
     private var outsideClickMonitor: Any?
+    /// Local keyDown monitor for the favorite-tool launch hotkeys (`Option+1…9`).
+    /// Active only while a file is staged on the chips stage (Pillar 1).
+    private var toolHotkeyMonitor: Any?
     private var dragOutEndTimer: Timer?          // polls mouse state after a drag-out gesture
+    /// System-wide ⌃⌘V hotkey (Carbon) that opens the clipboard-history picker. Consumes
+    /// the keystroke so the combo never leaks into the frontmost app. Live only while
+    /// clipboard tracking is enabled.
+    private let clipboardHotkey = GlobalHotkey()
 
     // ── Dismiss-race protection ───────────────────────────────────────────────
     // When hideOverlay() fires, dismissAnimated() starts a 0.14 s alpha fade.
@@ -45,6 +54,13 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         prewarmSwiftUI()
         setupStatusItem()
 
+        // Clipboard history: poll the pasteboard + arm the ⌃⌘V picker hotkey (both gated
+        // on the "Track Clipboard" toggle, default on).
+        if ClipboardHistoryStore.isEnabled {
+            ClipboardHistoryStore.shared.startMonitoring()
+            registerClipboardHotkey()
+        }
+
         NotificationCenter.default.addObserver(
             self, selector: #selector(handleShowOnboarding),
             name: .showOnboarding, object: nil
@@ -64,6 +80,10 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         NotificationCenter.default.addObserver(
             self, selector: #selector(handleShowCustomDisable),
             name: .showCustomDisable, object: nil
+        )
+        NotificationCenter.default.addObserver(
+            self, selector: #selector(handleShowFavoriteTools),
+            name: .showFavoriteTools, object: nil
         )
 
         // Finder "Add to AI Drop" Quick Action → opens Stage 2 with the selected files.
@@ -110,6 +130,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     @objc private func handleMinimizeOverlay()   { minimizeOverlay()   }
     @objc private func handleShowHotkeyPicker()  { showHotkeyPicker()  }
     @objc private func handleShowCustomDisable() { showCustomDisable() }
+    @objc private func handleShowFavoriteTools() { showSettings(section: .favoriteTools) }
 
     // MARK: - Finder "Add to AI Drop" Quick Action
 
@@ -254,34 +275,34 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         let disabledUntil = UserDefaults.standard.double(forKey: "disabledUntil")
         let isDisabled    = disabledUntil > now
 
-        // ── Title + subtitle (disabled, informational) ──────────────────────────
-        addInfoItem(to: menu, title: "AI Drop")
-        addInfoItem(to: menu, title: isDisabled ? pausedLabel(secs: disabledUntil - now)
-                                                 : tierLabel())
-        if !isDisabled, EntitlementStore.shared.tier == .freeHosted,
-           let usageLabel = UsageStore.shared.menuLabel {
-            addInfoItem(to: menu, title: usageLabel)
+        // ── Hosted free-tier usage (daily token budget, or trial count) ──────────
+        // Only for the hosted tier — BYOK has no metered limit. Kick a background
+        // refresh so the NEXT open reflects server-truth; this open shows the last
+        // mirrored snapshot. The bar is hidden during the interactions trial.
+        if EntitlementStore.shared.tier != .byok {
+            Task { await UsageStore.shared.refresh() }
+            if let usage = usageMenuItem() {
+                menu.addItem(usage)
+                menu.addItem(.separator())
+            }
         }
 
-        menu.addItem(.separator())
-
-        // ── Upgrade (locked until the hosted backend is live) ───────────────────
-        if BackendConfig.isBackendLive {
-            addItem(to: menu, title: "Upgrade to Pro", action: #selector(menuUpgrade))
-        } else {
-            addInfoItem(to: menu, title: "Upgrade to Pro — coming soon")
-        }
-
-        menu.addItem(.separator())
-
-        // ── Provider / settings ─────────────────────────────────────────────────
-        addItem(to: menu, title: "Change Language Model", action: #selector(menuChangeModel))
-        addItem(to: menu, title: "Settings…", action: #selector(menuOpenSettings), key: ",")
+        // ── Provider + settings (each setting opens the window scoped to itself) ─
+        // (The Upgrade/Pro line stays hidden until payments are wired.)
+        addItem(to: menu, title: "AI Provider",   action: #selector(menuChangeModel))
+        addItem(to: menu, title: "Window Size",   action: #selector(menuWindowSize))
+        addItem(to: menu, title: "Custom Prompts", action: #selector(menuCustomPrompts))
+        addItem(to: menu, title: "Favorite Tools", action: #selector(menuFavoriteTools))
 
         // ── Recent sessions (file + AI conversation, last 10) ───────────────────
         let historyItem = NSMenuItem(title: "Recent Sessions", action: nil, keyEquivalent: "")
         historyItem.submenu = buildHistorySubmenu()
         menu.addItem(historyItem)
+
+        // ── Clipboard history (last 20; ⌃⌘V opens the 10-item picker) ───────────
+        let clipItem = NSMenuItem(title: "Clipboard History", action: nil, keyEquivalent: "")
+        clipItem.submenu = buildClipboardSubmenu()
+        menu.addItem(clipItem)
 
         menu.addItem(.separator())
 
@@ -395,6 +416,73 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         return s
     }
 
+    // MARK: Clipboard-history submenu
+
+    /// Last 20 captures as icon + preview + time rows (newest first). A row copies the
+    /// entry back to the pasteboard; its ⌥-alternate removes it. Top of the submenu holds
+    /// the "Track Clipboard" toggle; the ⌃⌘V picker surfaces the most recent 10.
+    private func buildClipboardSubmenu() -> NSMenu {
+        let menu = NSMenu()
+
+        // Capture on/off — flips the poll AND the ⌃⌘V hotkey together.
+        let track = NSMenuItem(title: "Track Clipboard",
+                               action: #selector(menuToggleClipboard), keyEquivalent: "")
+        track.target = self
+        track.state = ClipboardHistoryStore.isEnabled ? .on : .off
+        menu.addItem(track)
+        menu.addItem(.separator())
+
+        let items = ClipboardHistoryStore.shared.items
+        guard !items.isEmpty else {
+            addInfoItem(to: menu, title: ClipboardHistoryStore.isEnabled
+                        ? "No clipboard history yet" : "Clipboard tracking is off")
+            addInfoItem(to: menu, title: "⌃⌘V opens the clipboard picker")
+            return menu
+        }
+
+        let df = DateFormatter()
+        df.dateFormat = "dd.MM.yy, HH:mm"
+
+        for item in items {
+            let dateStr = df.string(from: item.date)
+            let icon = ClipboardHistoryStore.shared.icon(for: item, size: 32)
+            let label = clipRowLabel(item)
+
+            // Normal row — copy back to the pasteboard.
+            let copy = NSMenuItem(title: label,
+                                  action: #selector(menuCopyClipItem(_:)), keyEquivalent: "")
+            copy.target = self
+            copy.representedObject = item.id.uuidString
+            copy.keyEquivalentModifierMask = []
+            copy.attributedTitle = historyTitle(name: label, date: dateStr, destructive: false)
+            copy.image = icon
+            menu.addItem(copy)
+
+            // ⌥-alternate row — remove just this entry.
+            let remove = NSMenuItem(title: label,
+                                    action: #selector(menuRemoveClipItem(_:)), keyEquivalent: "")
+            remove.target = self
+            remove.representedObject = item.id.uuidString
+            remove.isAlternate = true
+            remove.keyEquivalentModifierMask = [.option]
+            remove.attributedTitle = historyTitle(name: "Remove “\(label)”",
+                                                   date: dateStr, destructive: true)
+            remove.image = icon
+            menu.addItem(remove)
+        }
+
+        menu.addItem(.separator())
+        addItem(to: menu, title: "Clear Clipboard History", action: #selector(menuClearClipboard))
+        addInfoItem(to: menu, title: "Hold ⌥ to remove · ⌃⌘V opens the picker")
+        return menu
+    }
+
+    /// Single-line, length-capped menu label for a clipboard entry.
+    private func clipRowLabel(_ item: ClipItem) -> String {
+        let p = item.preview
+        return p.count > 50 ? String(p.prefix(50)) + "…" : p
+    }
+
     // MARK: Menu builders / labels
 
     @discardableResult
@@ -421,6 +509,87 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         }
     }
 
+    // MARK: Usage header (hosted free tier)
+
+    /// A non-interactive header showing the hosted free-tier allowance. During the
+    /// one-time interactions trial it's a plain "N free interactions left" line (NO
+    /// bar). After the trial it's a small progress bar of the daily TOKEN budget plus
+    /// a token overview. Returns nil for BYOK or before any usage snapshot exists.
+    private func usageMenuItem() -> NSMenuItem? {
+        let u = UsageStore.shared
+        let title: String
+        let subtitle: String
+        let progress: Double?   // nil ⇒ no bar (trial state)
+
+        if u.inTrial {
+            guard let left = u.trialRemaining else { return nil }
+            title = "AI Drop Free · Trial"
+            subtitle = "\(max(0, left)) free interactions left"
+            progress = nil
+        } else {
+            guard let rem = u.dailyTokensRemaining,
+                  let budget = u.dailyTokenBudget, budget > 0 else { return nil }
+            let pctFree = max(0, min(100, Int((Double(rem) / Double(budget) * 100).rounded())))
+            title = "AI Drop Free · Today"
+            subtitle = "\(pctFree)% left · \(Self.tokenFmt(rem)) / \(Self.tokenFmt(budget)) tokens"
+            progress = min(1, max(0, Double(budget - rem) / Double(budget)))
+        }
+
+        let item = NSMenuItem()
+        item.isEnabled = false
+        item.view = makeUsageView(title: title, subtitle: subtitle, progress: progress)
+        return item
+    }
+
+    /// Group-separated token count, e.g. `21,900`.
+    private static func tokenFmt(_ n: Int) -> String {
+        let f = NumberFormatter()
+        f.numberStyle = .decimal
+        f.maximumFractionDigits = 0
+        return f.string(from: NSNumber(value: n)) ?? "\(n)"
+    }
+
+    /// Custom NSView for the usage menu item: a small caption, an optional determinate
+    /// progress bar (daily token budget used), and a detail line. Frame-based layout —
+    /// fixed width sets the menu's minimum width.
+    private func makeUsageView(title: String, subtitle: String, progress: Double?) -> NSView {
+        let width: CGFloat = 230
+        let x: CGFloat = 14
+        let innerW = width - 2 * x
+        let height: CGFloat = progress == nil ? 38 : 52
+        let container = NSView(frame: NSRect(x: 0, y: 0, width: width, height: height))
+
+        let titleField = NSTextField(labelWithString: title)
+        titleField.font = .systemFont(ofSize: 11, weight: .semibold)
+        titleField.textColor = .secondaryLabelColor
+        titleField.frame = NSRect(x: x, y: height - 18, width: innerW, height: 14)
+        container.addSubview(titleField)
+
+        if let progress {
+            let bar = NSProgressIndicator(frame: NSRect(x: x, y: 22, width: innerW, height: 8))
+            bar.style = .bar
+            bar.isIndeterminate = false
+            bar.controlSize = .small
+            bar.minValue = 0
+            bar.maxValue = 1
+            bar.doubleValue = progress
+            container.addSubview(bar)
+
+            let detail = NSTextField(labelWithString: subtitle)
+            detail.font = .systemFont(ofSize: 11)
+            detail.textColor = .labelColor
+            detail.frame = NSRect(x: x, y: 4, width: innerW, height: 14)
+            container.addSubview(detail)
+        } else {
+            let detail = NSTextField(labelWithString: subtitle)
+            detail.font = .systemFont(ofSize: 12)
+            detail.textColor = .labelColor
+            detail.frame = NSRect(x: x, y: 6, width: innerW, height: 16)
+            container.addSubview(detail)
+        }
+        return container
+    }
+
     private func pausedLabel(secs: TimeInterval) -> String {
         if secs > 365 * 24 * 3600 { return "Paused · until re-enabled" }
         if secs > 3600            { return "Paused · \(Int(secs / 3600))h left" }
@@ -431,10 +600,10 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     @objc private func menuUpgrade()     { EntitlementStore.shared.startUpgrade() }
     @objc private func menuChangeModel()  { NotificationCenter.default.post(name: .showOnboarding, object: nil) }
-    @objc private func menuOpenSettings() {
-        NSApp.activate(ignoringOtherApps: true)
-        NSApp.sendAction(Selector(("showSettingsWindow:")), to: nil, from: nil)
-    }
+    @objc private func menuOpenSettings() { showSettings() }
+    @objc private func menuWindowSize()    { showSettings(section: .windowSize) }
+    @objc private func menuCustomPrompts() { showSettings(section: .customPrompt) }
+    @objc private func menuFavoriteTools() { showSettings(section: .favoriteTools) }
     @objc private func menuReEnable()     { UserDefaults.standard.set(0, forKey: "disabledUntil") }
     @objc private func menuDisableUntil(_ sender: NSMenuItem) {
         guard let ts = sender.representedObject as? TimeInterval else { return }
@@ -506,6 +675,37 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     }
 
     @objc private func menuClearHistory() { SessionHistoryStore.shared.clear() }
+
+    // MARK: Clipboard-history actions
+
+    /// Copy a stored entry back to the system pasteboard (the user pastes it with ⌘V).
+    @objc private func menuCopyClipItem(_ sender: NSMenuItem) {
+        guard let idStr = sender.representedObject as? String,
+              let id = UUID(uuidString: idStr),
+              let item = ClipboardHistoryStore.shared.items.first(where: { $0.id == id }) else { return }
+        ClipboardHistoryStore.shared.copyToPasteboard(item)
+    }
+
+    @objc private func menuRemoveClipItem(_ sender: NSMenuItem) {
+        guard let idStr = sender.representedObject as? String,
+              let id = UUID(uuidString: idStr) else { return }
+        ClipboardHistoryStore.shared.remove(id: id)
+    }
+
+    @objc private func menuClearClipboard() { ClipboardHistoryStore.shared.clear() }
+
+    /// Flip clipboard capture on/off — keeps the poll timer and the ⌃⌘V hotkey in lockstep.
+    @objc private func menuToggleClipboard() {
+        let enabled = !ClipboardHistoryStore.isEnabled
+        ClipboardHistoryStore.isEnabled = enabled
+        if enabled {
+            ClipboardHistoryStore.shared.startMonitoring()
+            registerClipboardHotkey()
+        } else {
+            ClipboardHistoryStore.shared.stopMonitoring()
+            unregisterClipboardHotkey()
+        }
+    }
 
     /// Detach the menu once it closes so the next plain left-click reaches
     /// `statusItemClicked` (and can restore a minimized session). Deferred because
@@ -683,9 +883,71 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                 // AppKit layout pass triggers the recursive "Update Constraints in Window"
                 // assertion → abort(). One async hop breaks that synchronous chain.
                 DispatchQueue.main.async { self?.resizeOverlay(for: stage) }
+                // Tool launch hotkeys (Option+1…9) live while a file is staged — the
+                // "Open in" row is shown in BOTH the chips and result stages, so the
+                // numbered badges must be functional in both.
+                switch stage {
+                case .chips, .result: self?.startToolHotkeys()
+                default:              self?.stopToolHotkeys()
+                }
             }
             .store(in: &cancellables)
     }
+
+    // MARK: - Tool launch hotkeys (Pillar 1)
+
+    /// Install the `Option+1…9` local monitor that opens staged files in a favorite
+    /// app. Local (not global) → it only sees our own app's key events, so it needs
+    /// no Accessibility permission and can't clash with system/other-app shortcuts.
+    private func startToolHotkeys() {
+        guard toolHotkeyMonitor == nil else { return }
+        toolHotkeyMonitor = NSEvent.addLocalMonitorForEvents(matching: .keyDown) { event in
+            // NSEvent local monitors are delivered on the main thread/runloop, so it
+            // is safe to run the @MainActor handler synchronously and return its result.
+            MainActor.assumeIsolated { AppDelegate.handleToolHotkey(event) }
+        }
+    }
+
+    private func stopToolHotkeys() {
+        if let m = toolHotkeyMonitor { NSEvent.removeMonitor(m); toolHotkeyMonitor = nil }
+    }
+
+    /// Returns `nil` to swallow a matched `Option+N` (so the digit never reaches the
+    /// prompt field); otherwise returns the event unchanged for normal handling.
+    @MainActor
+    private static func handleToolHotkey(_ event: NSEvent) -> NSEvent? {
+        // Bare Option only — ignore Option+Cmd / Option+Ctrl / Option+Shift chords.
+        let flags = event.modifierFlags.intersection(.deviceIndependentFlagsMask)
+        let urls = OverlayViewModel.shared.sessionFileURLs
+        // The "Open in" row is live in both the chips and result stages.
+        let inToolStage: Bool = {
+            switch OverlayViewModel.shared.stage {
+            case .chips, .result: return true
+            default:              return false
+            }
+        }()
+        guard flags == .option,
+              inToolStage,
+              let chars = event.charactersIgnoringModifiers, chars.count == 1,
+              let n = Int(chars), (1...9).contains(n),
+              let tool = FavoriteToolsStore.shared.tool(forNumber: n, for: urls)
+        else { return event }
+        FavoriteToolsStore.shared.launch(tool, with: urls)
+        return nil
+    }
+
+    // MARK: - Clipboard history hotkey (⌃⌘V)
+
+    /// Arm the global ⌃⌘V hotkey → toggle the clipboard picker. Carbon `RegisterEventHotKey`
+    /// consumes the keystroke (no leak to the frontmost app) and needs no Accessibility.
+    private func registerClipboardHotkey() {
+        clipboardHotkey.register(keyCode: UInt32(kVK_ANSI_V),
+                                 modifiers: UInt32(cmdKey | controlKey)) {
+            ClipboardPicker.shared.toggle()
+        }
+    }
+
+    private func unregisterClipboardHotkey() { clipboardHotkey.unregister() }
 
     /// Reposition (not resize) the window as the user drags the grabber handle.
     /// The grabber's DragGesture writes userDragOffset; we apply it to the window
@@ -732,6 +994,13 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             .receive(on: DispatchQueue.main).sink(receiveValue: resize)
             .store(in: &cancellables)
         PromptStore.shared.$history
+            .receive(on: DispatchQueue.main).sink(receiveValue: resize)
+            .store(in: &cancellables)
+        // Adding/removing a favorite app (in any list) changes the tool-row height —
+        // keep the chips window in sync if the user edits favorites while a session is
+        // on screen. objectWillChange covers every @Published list/flag; the resize is
+        // dispatched async so it reads the committed value.
+        FavoriteToolsStore.shared.objectWillChange
             .receive(on: DispatchQueue.main).sink(receiveValue: resize)
             .store(in: &cancellables)
     }
@@ -950,20 +1219,42 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         case .waitingForDrop:
             return (CGSize(width: 288 * s, height: 96 * s), false)   // canvas for wobble overflow
 
-        case .chips(_, let actions):
+        case .chips(let url, let actions):
+            if FileInspector.isMediaFile(url) {
+                // AI-free media stage: Utilities + "Open in" only, always expanded, NO
+                // prompt field. Mirrors ChipsColumnView's media layout so height fits exactly.
+                let utilCount = FileToolActions.utilityTools(
+                    for: url, sessionFiles: OverlayViewModel.shared.sessionFileURLs).count
+                let contentH = ChipsLayout.contentHeight(rows: max(utilCount, 1))
+                let toolH = FavoriteToolsStore.shared
+                    .resolvedTools(for: OverlayViewModel.shared.sessionFileURLs).isEmpty
+                    ? ChipsLayout.toolHintHeight : ChipsLayout.toolRowHeight
+                // header(50) + spacing(10) + tabBar + spacing(10) + content + spacing(10)
+                // + toolRow + padding(36)  — no prompt field, no collapsed branch.
+                let h = (50 + 10 + ChipsLayout.tabBarHeight + 10 + contentH + 10 + toolH + 36) * s
+                return (CGSize(width: 280 * s, height: max(h, 200 * s)), true)
+            }
             if OverlayViewModel.shared.isChipsExpanded {
                 // Height follows the ACTIVE prompt tab's row count (capped), using
                 // the same ChipsLayout numbers the SwiftUI content region uses so
                 // the window always fits exactly. See ChipsLayout.
                 let store = PromptStore.shared
+                let utilCount = FileToolActions.utilityTools(
+                    for: url, sessionFiles: OverlayViewModel.shared.sessionFileURLs).count
                 let rows = ChipsLayout.rows(for: OverlayViewModel.shared.chipsTab,
                                             suggested: actions.count,
                                             history: store.history.count,
-                                            custom: store.customPrompts.count)
+                                            custom: store.customPrompts.count,
+                                            utilities: utilCount)
                 let contentH = ChipsLayout.contentHeight(rows: rows)
-                // header(50) + spacing(10) + tabBar + spacing(10)
-                // + content + spacing(10) + prompt(42) + padding(36)
-                let h = (50 + 10 + ChipsLayout.tabBarHeight + 10 + contentH + 10 + 42 + 36) * s
+                // Tool launch row ("Open in"): full height when the resolved list has
+                // favorites, a single muted hint line when empty (matches ToolRow).
+                let toolH = FavoriteToolsStore.shared
+                    .resolvedTools(for: OverlayViewModel.shared.sessionFileURLs).isEmpty
+                    ? ChipsLayout.toolHintHeight : ChipsLayout.toolRowHeight
+                // header(50) + spacing(10) + tabBar + spacing(10) + content + spacing(10)
+                // + toolRow + spacing(10) + prompt(42) + padding(36)
+                let h = (50 + 10 + ChipsLayout.tabBarHeight + 10 + contentH + 10 + toolH + 10 + 42 + 36) * s
                 return (CGSize(width: 280 * s, height: max(h, 220 * s)), true)
             } else {
                 // Collapsed: header + spacing + prompt field + padding only
@@ -989,6 +1280,12 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
         case .error:
             return (CGSize(width: 500 * s, height: 220 * s), true)
+
+        case .fileResult:
+            // Utility "second result stage": single column with two stacked file-detail
+            // cards (output + original) and an action row. Fixed height; the bottom
+            // Spacer in FileResultView absorbs any slack from short detail grids.
+            return (CGSize(width: 500 * s, height: 430 * s), true)
         }
     }
 
@@ -1020,6 +1317,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private func stopDismissMonitors() {
         if let m = escapeMonitor       { NSEvent.removeMonitor(m); escapeMonitor       = nil }
         if let m = outsideClickMonitor { NSEvent.removeMonitor(m); outsideClickMonitor = nil }
+        stopToolHotkeys()   // never leave the Option+N monitor live past a dismiss
     }
 
     // MARK: - Disable helper
@@ -1027,6 +1325,54 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     /// True when the user has temporarily paused the pill via "Disable for X minutes".
     private var isPillDisabled: Bool {
         UserDefaults.standard.double(forKey: "disabledUntil") > Date().timeIntervalSince1970
+    }
+
+    // MARK: - Settings
+
+    /// Open (or re-focus) the Settings window. We manage a real NSWindow ourselves
+    /// instead of relying on SwiftUI's `showSettingsWindow:` selector: for an
+    /// accessory (menu-bar) app invoked from an NSMenu action, that selector silently
+    /// no-ops because the responder chain doesn't reach the SwiftUI Settings scene.
+    /// This path is deterministic — same pattern as showHotkeyPicker / showOnboarding.
+    func showSettings(section: SettingsSection = .all) {
+        // A grouped Form is vertically greedy → its auto-measured fitting height
+        // collapses to ~0 in a hosting controller. Pin an explicit content size so
+        // the Form gets a bounded height to lay out (and scroll) within.
+        // SettingsView is .frame(width: 420) + default .padding() ≈ 460 wide.
+        let size = settingsSize(for: section)
+        let hosting = NSHostingController(rootView: SettingsView(section: section))
+        hosting.preferredContentSize = size
+
+        if settingsWindow == nil {
+            let win = NSWindow(contentViewController: hosting)
+            win.styleMask = [.titled, .closable]
+            win.isReleasedWhenClosed = false   // reuse the instance on reopen
+            settingsWindow = win
+        } else {
+            // Reuse the window but re-root it so reopening to a different section
+            // swaps both the content and the chrome (title/size).
+            settingsWindow?.contentViewController = hosting
+        }
+
+        settingsWindow?.title = section.windowTitle
+        settingsWindow?.setContentSize(size)
+        settingsWindow?.center()
+        settingsWindow?.makeKeyAndOrderFront(nil)
+        NSApp.activate(ignoringOtherApps: true)
+    }
+
+    /// Per-section window height. The scoped sections are short; `.all` is the full
+    /// stack used by the system ⌘, scene.
+    private func settingsSize(for section: SettingsSection) -> NSSize {
+        let h: CGFloat
+        switch section {
+        case .all:           h = 640
+        case .windowSize:    h = 240
+        case .customPrompt:  h = 360
+        case .favoriteTools: h = 520
+        case .aiProvider:    h = 480
+        }
+        return NSSize(width: 460, height: h)
     }
 
     // MARK: - Hotkey picker
@@ -1122,6 +1468,7 @@ extension Notification.Name {
     static let minimizeOverlay  = Notification.Name("com.aidrop.minimizeOverlay")
     static let showHotkeyPicker = Notification.Name("com.aidrop.showHotkeyPicker")
     static let showCustomDisable = Notification.Name("com.aidrop.showCustomDisable")
+    static let showFavoriteTools = Notification.Name("com.aidrop.showFavoriteTools")
     static let addFilesFromShare = Notification.Name("com.aidrop.addFilesFromShare")
 }
 

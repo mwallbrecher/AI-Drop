@@ -116,6 +116,13 @@
 - **Fix**: Wrap in `withCheckedContinuation` and `await` inside `Task { @MainActor in }`
 - **Rule**: `SFSpeechRecognizer.requestAuthorization` is NOT guaranteed to call back on main thread. Always bridge it with `withCheckedContinuation`.
 
+### [CONC-03] A local `NSEvent` monitor must return synchronously — bridge @MainActor work with `MainActor.assumeIsolated`
+- **Context**: Pillar-1 `Option+1…9` launch hotkeys use `NSEvent.addLocalMonitorForEvents(matching: .keyDown)`, whose handler is `(NSEvent) -> NSEvent?` (return the event to pass it through, `nil` to swallow it).
+- **Problem**: The handler needs `@MainActor` state (`OverlayViewModel.stage`, `FavoriteToolsStore`). `Task { @MainActor in }` (the CONC-01 fix) is async — it can't produce the `NSEvent?` return value the monitor needs *now*, so you can't use it here.
+- **Fix**: Local monitors are delivered on the main thread/runloop, so wrap the body in `MainActor.assumeIsolated { … }` and return its result. This satisfies isolation checking AND returns synchronously. (`assumeIsolated` is available on the deployment target, macOS 14.)
+- **Scope it**: install the monitor only while the relevant stage is live (`stage == .chips`) and remove it otherwise + in `stopDismissMonitors`; gate the match on the exact modifier set (`flags == .option`) and `charactersIgnoringModifiers` so it never eats the prompt field's own keys.
+- **Rule**: global monitor + side-effect only → `Task { @MainActor in }`. **Local** monitor that must return a value → `MainActor.assumeIsolated`. Never `DispatchQueue.main.async` (CONC-01).
+
 ---
 
 ## Drag Detection
@@ -229,6 +236,12 @@
 - **Disable submenu**: use one selector `menuDisableUntil(_:)` reading `representedObject` (the absolute `disabledUntil` timestamp) instead of N selectors. Settings item still uses the `showSettingsWindow:` selector (MENU-01).
 - **Rule**: a menu-shaped SwiftUI view (`Button`/`Divider`/`Menu`) only looks native inside `MenuBarExtra`'s `.menu` style. Once you own the `NSStatusItem`, author the menu as an `NSMenu`, not a hosted SwiftUI card. (`MenuBarView.swift` was deleted as dead code.)
 
+### [MENU-04] `showSettingsWindow:` silently no-ops from an NSMenu in an accessory app — manage the Settings NSWindow yourself
+- **Symptom**: after MENU-01/03 (MenuBarExtra → NSStatusItem + NSMenu), the "Settings…" menu item did nothing — no window appeared.
+- **Root cause**: `NSApp.sendAction(Selector(("showSettingsWindow:")), to: nil, from: nil)` (the MENU-01/03 approach) walks the responder chain looking for a handler installed by SwiftUI's `Settings` scene. For an `LSUIElement` agent with no key window — and dispatched from a status-item NSMenu action — that responder is **not reachable**, so `sendAction` returns false and nothing opens. (`MenuBarExtra` had provided a working Settings command for free; hand-rolling the menu lost it.)
+- **Fix**: open a real `NSWindow` we own (`NSHostingController(rootView: SettingsView())`, `isReleasedWhenClosed = false`, `makeKeyAndOrderFront` + `NSApp.activate(ignoringOtherApps: true)`) — the exact pattern already used by `showHotkeyPicker` / `showOnboarding`. Keep the `Settings { SettingsView() }` scene for the system ⌘, (it shares the same singleton stores, so a second instance stays state-consistent).
+- **Rule**: in a menu-bar/accessory app, don't rely on `showSettingsWindow:` from menu actions — present settings via a self-managed `NSWindow`. Selector-based scene routing only works when the SwiftUI scene's responder is in the chain.
+
 ---
 
 ## General
@@ -261,3 +274,130 @@
   user turn. Requires `wrangler deploy` (the agent can edit JS but cannot deploy).
 - **Rule:** when changing the `AIProvider` wire shape, grep `worker/src` in the SAME change
   and update `/v1/complete` to match. The Worker is a provider too — treat it like one.
+
+### [COST-01] "Supporting" a new file type can silently bill the operator — binary → Latin-1 garbage
+- **Context:** added video/audio (`.mp4`/`.mp3`/…) as droppable so they reach the chips stage.
+  The naive change is to delete them from `FileInspector`'s unsupported list — but that ALSO routes
+  them into the hosted-AI path.
+- **What was wrong:** `FileContentExtractor.extract` has a catch-all `default:` text reader whose last
+  resort decodes raw bytes as `isoLatin1` (so non-UTF-8 *text* never throws). For a binary mp4/mp3 that
+  yields ~24k chars of garbage that would be POSTed to Gemini on any prompt → real operator tokens spent
+  for a guaranteed-nonsense answer. A clean build hides this completely.
+- **Fix:** decouple "droppable" from "has AI actions." `isUnsupportedFileType` exempts media (droppable
+  for Pillar 1/2) while `suggestedActions` returns `[]`. The media chips stage hides the prompt field +
+  AI tabs so the model can't be invoked by construction, and `buildMultiFileContent` ALSO guards
+  (single-media throws; multi-file skips with a placeholder) as defense-in-depth.
+- **Rule:** before marking any file type "supported," trace what `FileContentExtractor` does with it.
+  If it can't produce meaningful text/vision input, it must NOT reach the model — block at the UI
+  (no prompt path) AND in the content builder. Operator cost first: a metering hole opened by a
+  too-permissive extractor is invisible until the bill arrives.
+
+### [MEDIA-01] Media utilities are async — sync dispatch would beach-ball; keep heavy work off the main actor
+- **Context:** batch-2 media tools (`Core/MediaTools.swift`: extract audio, transcribe, GIF, frame,
+  compress, mute, convert). The batch-1 utility dispatch (`FileToolActions.run` → `try op()`) runs the
+  op **synchronously on the main thread** — fine for instant ImageIO/PDFKit, fatal for AVFoundation.
+- **What was wrong (avoided by design):** an `AVAssetExportSession` export, a 100-frame GIF decode, or a
+  whole-file transcription takes seconds. Reusing the sync path would freeze the overlay (spinning
+  beachball) for the duration. Also: the project sets `SWIFT_DEFAULT_ACTOR_ISOLATION = MainActor`, so a
+  plain `enum MediaTools` is implicitly `@MainActor` — naive `async` funcs would still hop back to main
+  for CPU work.
+- **Fix:** separate async path. `FileToolActions.performAsync(_:fileURL:sessionFiles:) async` for the
+  9 media cases (sync `perform` untouched for the rest). The view sets `@State runningTool` → `Task { await
+  performAsync(); runningTool = nil }`, and `MenuActionRow(isLoading:)` shows a per-row spinner +
+  `.disabled` (re-entrancy guarded so one media op runs at a time). Heavy CPU (GIF/frame `copyCGImage`
+  loops) runs inside `DispatchQueue.global(qos:.userInitiated).async` bridged by
+  `withCheckedThrowingContinuation`, so the main actor is never blocked even though the type is
+  MainActor-isolated. Exports/transcription are already off-main via AVFoundation/Speech's own threads.
+- **Gotchas baked in:** (1) deployment target is 14 → use `session.exportAsynchronously` (NOT the 15+
+  `export(to:as:)`); the modern async `load(.duration)` / `loadTracks(_:)` are 13+ so they're fine.
+  (2) Container convert + mute try `AVAssetExportPresetPassthrough` first, fall back to `HighestQuality`
+  on codec/container incompatibility (and delete the partial output before retry). (3) Transcription:
+  authorize via `SFSpeechRecognizer.requestAuthorization`, set `requiresOnDeviceRecognition` only when
+  `supportsOnDeviceRecognition` (on-device = no network, no length cap, no operator cost; the
+  `NSSpeechRecognitionUsageDescription` string was already in the pbxproj from dictation, so NO Info.plist
+  edit). For VIDEO, extract audio to a temp `.m4a` first — feeding a video container to
+  `SFSpeechURLRecognitionRequest` is unreliable. (4) Every op writes a deduped sibling via
+  `FileTools.uniqueDestination` and the caller reveals it in Finder — same contract as batch 1.
+- **Rule:** any new utility backed by AVFoundation/Speech/Vision (or anything that can take >100 ms) goes
+  through `performAsync` + `runningTool` spinner, with the blocking work explicitly dispatched off the
+  main actor. Never extend the sync `run` path for slow ops. Cost note: all of this is local/on-device →
+  zero proxy/Gemini spend, consistent with operator-bill-first.
+
+### [TEXT-01] Not every utility produces a file — add an INFO path; build CSV/JSON by hand to keep order & types
+- **Context:** batch-3 text/data tools (`Core/FileTools.swift`: sort/dedupe lines, count, SHA-256,
+  Base64 ↔, minify JSON, CSV ↔ JSON). All synchronous Foundation/CryptoKit — correctly kept on the sync
+  `run` path (instant, unlike batch-2 media; the `isAsync` flag stays false).
+- **What was new:** two ops (`countStats`, `sha256`) return a VALUE, not a sibling file, so the existing
+  "return URL → reveal in Finder" contract didn't fit. Added `FileToolActions.runInfo(title:) { String }`
+  + `presentInfo` → an `NSAlert` with **Copy** (→ `NSPasteboard`) / **Done**. New presentation path, no
+  new stage, no enum flag. SHA-256 streams the file in 1 MB chunks via `FileHandle.read(upToCount:)` +
+  `SHA256().update`/`finalize` so a multi-GB file never loads into RAM.
+- **CSV/JSON gotchas (the real work):** `JSONSerialization` on a Swift dictionary loses key ORDER and you
+  can't choose it — so `csvToJSON` builds the JSON string BY HAND (column order preserved) and treats
+  every cell as a STRING (CSV has no types → lossless, no number/bool guessing). `jsonToCSV` goes the
+  other way: union of keys SORTED (dicts are unordered, so first-seen order is meaningless), RFC-4180
+  quoting (`csvField`: quote on comma/quote/newline, double embedded quotes), nested values → compact
+  JSON, `NSNull` → empty, `NSNumber` bool detected via `CFGetTypeID(n) == CFBooleanGetTypeID()`. The CSV
+  reader is a hand-rolled RFC-4180 state machine (handles quoted commas/newlines, `""` escapes, `\r\n`).
+- **Trailing-newline trap:** `text.components(separatedBy:"\n")` on a file ending in `\n` yields a trailing
+  empty element. Sorting/deduping it silently reorders or drops the blank line and changes the file. Fix:
+  `splitLines` strips the trailing empty element and reports `trailingNewline` so transforms re-emit it.
+- **Gating:** new `FileInspector.isTextFile` + `textExtensions` (plain text/code/data only — deliberately
+  NOT pdf/docx/rtf, which are containers, not line-oriented text). `.b64`/`.base64` are in the set so a
+  dropped Base64 file offers Decode instead of Encode. SHA-256 is the one UNIVERSAL addition (any file).
+- **Rule:** a utility that yields a value (hash, counts, info) uses `runInfo`/`presentInfo` (Copy button),
+  not the reveal-sibling path. For structured-data conversions, hand-build the output when you need to
+  preserve column order or avoid type coercion — `JSONSerialization`'s dict round-trip will betray both.
+  All local → zero API cost, operator-bill-first intact.
+
+### [QL-01] The Quick Look "accepts" hook is `acceptsPreviewPanelControl(_:)`, not `acceptsPreviewPanel(_:)`
+- **Context:** adding system Quick Look (`QLPreviewPanel`) preview on pill click. `QLPreviewPanel` walks
+  the key window's responder chain for an object implementing the informal `QLPreviewPanelController`
+  protocol. `OverlayWindow` (NSPanel, `canBecomeKey`) is the responder; I added the three hooks with
+  `override func` since they live on a category that NSResponder picks up.
+- **What was wrong:** I named the first hook `acceptsPreviewPanel(_:)`. Build failed with exactly one
+  error: `method does not override any method from its superclass`. The other two hooks
+  (`beginPreviewPanelControl`/`endPreviewPanelControl`) compiled — so it looked like *they* were the
+  problem, but the real culprit was the misnamed accepts-hook (the only one whose name I'd shortened).
+- **Fix:** rename to `acceptsPreviewPanelControl(_ panel: QLPreviewPanel!) -> Bool`. All three hooks use
+  `override` (the category methods are inherited via NSResponder); none need a bare `@objc`.
+- **Why it misled:** a wrong-name `override` reports against the *declaration line that has no match*,
+  not against the conceptually-related neighbors. When one of N `override`s in a cluster fails, suspect a
+  typo'd selector on THAT line first — don't assume the whole protocol is mis-imported.
+- **Rule:** the QL responder-chain trio is `acceptsPreviewPanelControl(_:) -> Bool` /
+  `beginPreviewPanelControl(_:)` / `endPreviewPanelControl(_:)`, all `override` on an NSResponder
+  subclass. Point the panel's `dataSource`/`delegate` at your controller in `begin`, nil them in `end`.
+  NSURL conforms to `QLPreviewItem` natively — no wrapper needed. Works from any non-sandboxed app;
+  Quick Look is not Finder-only.
+
+### [CLIP-01] An NSEvent local monitor's `?? event` resurrects a key you meant to swallow
+- **Context:** the ⌃⌘V clipboard picker (`ClipboardPicker`) installs a local keyDown monitor so digit
+  keys (1–9, 0) and Esc select/dismiss while the borderless panel is key. The monitor closure must
+  return `NSEvent?` — return the event to pass it through, return `nil` to swallow it.
+- **What was wrong:** I wrote `MainActor.assumeIsolated { self?.handleKey(event) ?? event }`. When
+  `handleKey` returns `nil` (its signal for "I handled this, swallow it") the `?? event` immediately
+  substitutes the original event back — so every matched digit/Esc was *passed through* to the app under
+  the panel. The swallow never happened; numbers would type into whatever was focused.
+- **Why:** optional-chaining + `??` collapses two distinct nils ("self is gone" and "handler swallowed")
+  into one branch, and the fallback (`event`) is exactly the value the handler was trying to suppress.
+- **Fix:** guard `self` first, then return the handler's result verbatim:
+  `guard let self else { return event }; return MainActor.assumeIsolated { self.handleKey(event) }`.
+  Now `nil` from the handler propagates as the swallow.
+- **Rule:** in an `addLocalMonitorForEvents` closure, never `?? event` the handler's return. Unwrap
+  `self` separately and pass the handler's `NSEvent?` through untouched, so its `nil`-means-swallow
+  contract survives. (The favorite-tools `handleToolHotkey` already does this — it returns the event or
+  `nil` directly with no coalescing.)
+
+### [CLIP-02] Carbon `RegisterEventHotKey` is the right tool for a system hotkey that must NOT leak
+- **Context:** ⌃⌘V should open the clipboard picker from anywhere and the combo must not also reach the
+  frontmost app's text field. An `NSEvent` global monitor can observe keys app-wide but **cannot consume
+  them** (and needs Accessibility). Carbon `RegisterEventHotKey` registers a system hotkey that the OS
+  routes to us and **swallows** before the focused app sees it — and needs no Accessibility permission.
+- **Pattern (`Core/GlobalHotkey.swift`):** `InstallEventHandler` + `RegisterEventHotKey`; the C callback
+  is a bare function (no captured context), so pass `Unmanaged.passUnretained(self).toOpaque()` as
+  `userData` and recover it INSIDE `MainActor.assumeIsolated { Unmanaged<GlobalHotkey>.fromOpaque(...) }`
+  — only the raw pointer crosses the actor boundary, never a non-Sendable value. Carbon hotkey events are
+  delivered on the main runloop so `assumeIsolated` is sound.
+- **Rule:** "global shortcut that consumes the keystroke + no Accessibility" → Carbon RegisterEventHotKey.
+  "observe our own app's keys, optionally swallow, no system scope" → `addLocalMonitorForEvents`.
+  "observe other apps' keys, cannot swallow, needs Accessibility" → `addGlobalMonitorForEvents`.

@@ -16,7 +16,8 @@
   chips appear → tap one → the result renders inline under the notch.
 - **BYOK today** (Bring Your Own Key): Groq / Anthropic / OpenAI / Ollama / Gemini.
 - Pure Apple frameworks, **no third-party packages**.
-- Deployment target **macOS 26.0**, Swift 5, hardened runtime ON, App Sandbox OFF.
+- Deployment target **macOS 14.0** (lowered from 26.0 on 2026-06-01), Swift 5, hardened runtime ON,
+  App Sandbox OFF.
 - Distribution: **Path A** — Developer-ID notarized direct-download DMG (NOT the Mac App
   Store). See §4.
 
@@ -243,6 +244,11 @@ A `scripts/release.sh` to automate this was offered but not yet written.
   you own the `NSStatusItem`, author a real `NSMenu` (rebuilt per open). `MenuBarView.swift` was
   deleted as dead code.
 
+**Cost / operator bill**
+- COST-01 "Supporting" a new file type can silently bill the operator: an unhandled binary type
+  falls through `FileContentExtractor` to a Latin-1 text read → ~24k chars of garbage shipped to
+  the model. Decouple *droppable* from *AI-eligible*; gate media to Utilities/Open-in only.
+
 **General**
 - GEN-01 Plan mode for any 3+ step / architectural change — write `tasks/todo.md`, confirm first.
 - GEN-02 Capture each lesson immediately (What was wrong → Why → Fix → Rule).
@@ -250,9 +256,13 @@ A `scripts/release.sh` to automate this was offered but not yet written.
 ---
 
 ## 7. Known gaps / sharp edges
-- **Deployment target macOS 26.0** — won't launch on older OSes; lowering needs `@available`
-  guards (mic path is version-sensitive, MIC-04 vs MIC-05) and a 14/15 test machine.
-- **DMG is dev-signed, not notarized** — see §4 for what's needed.
+- **Deployment target macOS 14.0** (lowered from 26.0). Compiles clean with no `@available`
+  guards (Liquid Glass is a custom `NSVisualEffectView`, not the 26-only API). ⚠️ The **14/15 mic
+  branch** (`SpeechRecognizer` → `AVAudioApplication`) is **runtime-UNVERIFIED** — built from the
+  documented lessons, no 14/15 test machine was available. The macOS 26 mic path is unchanged/verified.
+- **Notarization is now set up** (§4) — Developer ID cert + a `notarytool` keychain profile
+  `AIDrop-Notary` (team ASN2KAJ266); `scripts/release.sh` automates archive→export→notarize→staple→
+  DMG. The `AIDrop-0.9.8.dmg` in flight is **stale** (predates §9) → re-cut after manual tests.
 - **Hosted free tier is now CODE-COMPLETE** (metering, routing, spend) — see §8. Goes live the
   moment `BackendConfig.proxyBaseURL` is set + the Worker is deployed. App Attest auth, Paddle
   payments, and the in-app usage UI remain deferred (see `tasks/todo.md` Phase 2/3). Paddle stays
@@ -341,3 +351,213 @@ The spend write costs the user nothing (see 8f).
    (re-runs all `CREATE TABLE IF NOT EXISTS` — harmless).
 4. *(already done)* `ALTER TABLE usage ADD COLUMN tokens …`; `ALTER TABLE accounts ADD COLUMN pro …`.
 5. Read it: `curl -H "X-Admin-Token: <token>" https://aidrop.aidrop.workers.dev/v1/stats?days=7`
+
+---
+
+## 9. Session 2026-06-02/03 — file utilities, media support, favorites by file type
+
+Three independent features, **all build-green, all owner-manual-test pending.** Governing theme
+stays the operator-bill priority (§8): each is **zero hosted-AI cost by construction** — native
+on-device frameworks or client-only routing, no Gemini call.
+
+### 9a. Pillar 2 — local FREE file utilities (first batch, 7 tools)
+On-device file transforms that never touch any AI — pure operator-cost-free value. Surfaced in the
+chips stage's **Utilities** tab; each writes a deduped **sibling** output and reveals it in Finder.
+- **`Core/FileTools.swift`** engine funcs (all Apple frameworks): `convertImage` (ImageIO,
+  orientation-corrected via an `orientedImage` helper), `stripImageMetadata` (Exif/GPS/ExifAux/
+  TIFF/IPTC dropped with `kCFNull`, **no re-encode**), `splitPDF` (one `.pdf`/page → `<name>-pages/`,
+  throws if <2 pages), `pdfToImages` (PNG/page @2× → `<name>-images/`), `imagesToPDF`,
+  `prettyPrintJSON` (sortedKeys/withoutEscapingSlashes), `compress` (NSFileCoordinator
+  `.forUploading` → sibling `.zip`).
+- New `FileTool` cases: `.pdfSplit / .pdfToImages / .convertToJPEG / .stripEXIF / .imagesToPDF /
+  .prettyJSON / .compress` (title + SF Symbol each). `tools(for:sessionFiles:)` gates by type:
+  PDF→split/toImages, image→toJPEG(unless already jpg)/stripEXIF/toPDF, json→prettyJSON,
+  **always**→compress.
+- New error cases `.pdfSinglePage / .noImages / .invalidJSON`. Dispatch wired in
+  `UI/FileToolsMenu.swift` (needs `import UniformTypeIdentifiers` for `UTType.jpeg`).
+- Remaining ideas recorded as backlog in `tasks/todo.md`.
+
+### 9b. Video/audio support — droppable, AI-free
+Owner: "I can't drop an mp4." Media was routed to the **error** stage. Made it **droppable** for
+Pillar 1/2 (Open-in + Utilities) while keeping the **hosted AI OFF**.
+- **Why AI stays off:** `FileContentExtractor`'s default branch decodes unknown binary as Latin-1 →
+  would ship ~24k chars of garbage to Gemini and burn the operator's tokens. Lesson **COST-01**.
+- `FileInspector`: `videoExtensions`/`audioExtensions` + `isVideoFile`/`isAudioFile`/`isMediaFile`;
+  media returns `[]` suggested actions but is **not** "unsupported" (`isUnsupportedFileType` → false).
+- The media chips stage (`OverlayView.ChipsColumnView`) hides the prompt field + AI tabs, showing
+  only **Utilities + Open-in** — the model is unreachable *by construction*. `buildMultiFileContent`
+  also *guards*: a lone media file throws; multi-file drops skip media with a
+  `[Media: … not analysed]` marker.
+- `OverlayViewModel.setChips` defaults media sessions to the `.utilities` tab;
+  `AppDelegate.sizeForStage` has a media `.chips` branch (no prompt-field height).
+- `.zip/.dmg/.pkg/.exe` etc. still route to the error stage (genuinely unsupported).
+
+### 9c. Favorite apps organized by file type (per-category tabs + General)
+Owner: "tabs for each file type (video, image, text, audio) + a General tab where users either pick
+their own or tick **Use General**."
+- **`FileInspector.category(for:)`** + new `FileCategory` enum (`image/video/audio/text`; `.text` =
+  catch-all for PDF/code/json/docx/etc., +`title`/`systemImage`).
+- **`FavoriteToolsStore`** reworked: flat `tools` → a shared **`general`** list + per-category
+  `CategoryFavorites { useGeneral, tools }` (`categories: [FileCategory: …]`), each capped at 9.
+  Resolution for a drop = `category.useGeneral ? general : category.tools`, keyed off the
+  **primary/first** file. New API: `tools(for:)`, `useGeneral`/`setUseGeneral`, scope-aware
+  `add/remove/move`, `resolvedTools(for:[URL])`, `tool(forNumber:for:)`.
+- **Migration:** persistence key `favoriteTools.v1` → **`.v2`** (`PersistedConfig`, String-keyed
+  dict so JSON stays a plain object). On first load the old flat list moves into **General** with
+  every category defaulting `useGeneral = true` → existing users see no behavior change.
+- **Consumers rewired:** `ToolRow` renders `resolvedTools(for: vm.sessionFileURLs)`; `AppDelegate`
+  ⌥N handler uses `tool(forNumber:for:)`, the chips-resize observer now watches the store's
+  `objectWillChange` (covers every list/flag), both `sizeForStage` `.isEmpty` checks use the
+  resolved list. `SettingsView` favorite-tools section is a segmented Picker
+  (General | Image | Video | Audio | Text); category tabs carry a **"Use General favorites"** toggle
+  (on → note + hidden list; off → that category's editable list). Settings height 420 → 520.
+- **Note:** a multi-file drop resolves by the *first* file's type (matching how the primary file
+  already drives the chips stage). A "mixed drop → General" fallback is an open follow-up.
+
+### 9d. Status / owed
+- All three **build green**; **owner manual-tests pending** — run each utility & confirm Finder
+  reveal; drop mp4/mov/mp3/m4a → Utilities+Open-in only, no prompt, height fits; set a category's
+  own apps and confirm the row + ⌥N reflect it, then toggle Use General back.
+- The in-flight **`AIDrop-0.9.8.dmg` is stale** (predates all of the above) → re-cut via
+  `scripts/release.sh` after manual tests.
+- **Worker deploy still owed** (§8i) — thrifty routing + token budget are inert until `wrangler deploy`.
+- Many uncommitted changes; **do not commit until the owner confirms.**
+
+## 10. Session 2026-06-03 — media utilities (Pillar 2, batch 2)
+
+Batch-1 made video/audio droppable but they only offered Compress(.zip) + Open-in. Batch 2 gives them
+real, **100% local / on-device** value (AVFoundation + Speech) — **zero proxy/Gemini cost** (transcription
+prefers on-device; even Apple's server fallback is Apple's free Speech service, not the operator bill).
+- **New `Core/MediaTools.swift`** (`enum MediaTools`, async funcs, all writing deduped siblings +
+  Finder-reveal): `extractAudio` (video→.m4a), `transcribe` (audio|video→.txt; video reduced to a temp
+  .m4a first; on-device `SFSpeechURLRecognitionRequest` when `supportsOnDeviceRecognition`),
+  `videoToGIF` (10fps / ≤480px / first ≤10s; ImageIO GIF), `extractFrame` (midpoint→.png),
+  `compressVideo` (720p .mp4), `muteVideo` (video-only composition→.mp4), `convertVideo` (mp4↔mov,
+  passthrough→HighestQuality fallback), `convertAudio` (→.m4a).
+- **`FileTool`**: +9 cases with titles / macOS-14-safe SF Symbols + `var isAsync`. Video/audio branches
+  added to `tools(for:sessionFiles:)`; Convert-to-MP4/MOV/M4A hidden when already that format.
+- **Async dispatch (the one real arch change):** media ops are slow → can't use batch-1's sync
+  main-thread `run`. Added `FileToolActions.performAsync`; the Utilities tab sets `@State runningTool`,
+  runs in a `Task`, shows a per-row spinner via `MenuActionRow(isLoading:)`, and blocks re-entrancy.
+  Heavy CPU (GIF/frame loops) dispatched to a global queue via continuations so the main actor never
+  blocks (the type is implicitly `@MainActor` under `SWIFT_DEFAULT_ACTOR_ISOLATION`). See lesson MEDIA-01.
+- **No Info.plist / pbxproj edits:** `NSSpeechRecognitionUsageDescription` was already declared (dictation);
+  project uses synchronized file groups so the new file auto-includes. **Build green, no warnings.**
+- **Scope:** confirmed "core set first" — **Trim, Normalize audio, GIF-options picker DEFERRED** (need
+  parameter dialogs). **Owner manual-test owed:** drop mp4/mov → each video op reveals a sibling + spinner
+  shows, no beachball; mp3/m4a → Transcribe + Convert to M4A; first Transcribe triggers the permission prompt.
+
+## 11. Session 2026-06-03 — text/code/data utilities (Pillar 2, batch 3)
+
+Filled the emptiest format: plain text/code previously had ONLY reveal/rename/move/compress. All ops are
+**local, synchronous Foundation/CryptoKit** — zero API cost, no async (unlike batch 2), no dialogs.
+- **`Core/FileTools.swift` engine** (all deduped siblings + Finder-reveal, except the two info ops):
+  `sortLines` / `dedupeLines` (case-insensitive numeric sort; trailing-newline preserved via `splitLines`),
+  `countStats` (→ String), `sha256` (chunked `FileHandle` stream → hex), `base64Encode` (raw bytes → `.b64`,
+  MIME 76-col), `base64Decode` (whitespace-stripped → `-decoded.txt`/`.bin` by UTF-8 sniff), `minifyJSON`
+  (compact `JSONSerialization`), `csvToJSON` (hand-rolled RFC-4180 parser → column-order-preserving,
+  all-string JSON), `jsonToCSV` (array-of-objects → CSV, union keys sorted, RFC-4180 quoting, nested →
+  compact JSON). New errors: notTextReadable / invalidBase64 / invalidCSV / jsonNotTabular.
+- **The one arch change — an INFO path:** `countStats` + `sha256` return a VALUE not a file, so
+  `FileToolActions` gained `runInfo` → `presentInfo` (NSAlert with **Copy** → `NSPasteboard` / **Done**).
+  Everything else reuses the sync `run {}` reveal-sibling path; `isAsync` stays false for all 9 (they're
+  instant). See lesson **TEXT-01**.
+- **`FileTool`**: +9 cases (titles + macOS-14-safe SF Symbols). **Gating** via new
+  `FileInspector.isTextFile`/`textExtensions` (plain text/code/data — NOT pdf/docx): text block
+  (sort/dedupe/count/base64), json block (+minify, +jsonToCSV), csv block (csvToJSON), `.b64`→Decode.
+  **SHA-256 is universal** (any file, near Compress).
+- **No Info.plist / pbxproj edits** (synchronized file groups). **Build green, no warnings.**
+- **Owner manual-test owed:** `.txt`/`.log` → Sort, Dedupe, Count (alert+Copy), Base64 Encode (.b64);
+  that `.b64` → Decode round-trips; `.csv` → CSV→JSON; `.json` → Minify + JSON→CSV; any file → SHA-256
+  (hex matches `shasum -a 256`). Each sibling reveals, no clobber.
+
+## 12. Session 2026-06-03 — Quick Look preview on pill click
+
+Single-clicking a dropped-file pill now opens the **system Quick Look panel** (the Finder-spacebar
+preview), full-size, for images / PDF / video / audio / text / code — with ◀ ▶ across a multi-file
+session. Quick Look is **not Finder-only**: `QLPreviewPanel` is a shared system panel any app can
+present, and we're non-sandboxed already holding the URLs, so it "just works."
+- **`UI/QuickLookPreview.swift` (NEW):** `QuickLookController` singleton conforming to
+  `QLPreviewPanelDataSource` (NSURL is a `QLPreviewItem` natively) + `QLPreviewPanelDelegate`.
+  `present(urls:current:)` filters to on-disk files, makes the overlay key (so the panel finds the
+  responder-chain controller), then opens / re-points `QLPreviewPanel.shared()`.
+- **`UI/OverlayWindow.swift`:** `import Quartz` + the three informal-protocol hooks —
+  `acceptsPreviewPanelControl(_:) -> Bool`, `beginPreviewPanelControl(_:)` (sets dataSource/delegate/
+  index), `endPreviewPanelControl(_:)`. (The `OverlayWindow` is already `canBecomeKey`.)
+- **`UI/OverlayView.swift`:** `.onTapGesture` on `SingleFilePill` (whole icon+name row, opens index 0)
+  and `FilePill` (icon-only, opens that file's index). Subtitle copy → "Click to preview · drag to move".
+  Share button stays outside the tap target; tap and drag-to-move don't conflict.
+- **Dismiss-monitor safety (verified):** outside-click only dismisses in Stage-1 `.waitingForDrop`
+  (preview is reached in chips/result); Esc is a GLOBAL monitor (fires only for *other* apps), so Esc
+  inside the in-app QL panel closes the panel and leaves the session open.
+- **Build green** (one fix: the accepts-hook is `acceptsPreviewPanelControl`, not `acceptsPreviewPanel`
+  — see lesson **QL-01**). **Owner manual-test owed:** single & multi-file pills preview, ◀ ▶ navigates,
+  Esc closes panel not session, drag-to-move + Share still work.
+
+---
+
+## 13. Session 2026-06-03 — utility "second result stage" (Pillar 2)
+
+Every **file-producing** utility now lands on a dedicated result stage instead of only flashing a
+Finder reveal: a card that places the new output next to the original and shows **rich details of
+both** (size + delta, kind, type-specific facts), with Reveal-in-Finder / Quick Look / ← back.
+Scope (owner-chosen): **all file-creating ops**; rename-in-place + the Count / SHA-256 alert ops are
+**unchanged**. Auto-reveal stays (Finder selects the output) **and** the card shows.
+- **`OverlayViewModel.Stage.fileResult(original: URL, output: URL, tool: FileTool)`** (tag 5,
+  `fileURL`→original). Both `remapSessionURL` switches carry it (rename remaps both URLs). New
+  `returnToChips()` helper rebuilds `.chips` from the primary file for the ← back action.
+- **`Core/FileFacts.swift` (NEW):** `nonisolated`, `Sendable` `FileFacts.gather(_:) async -> Facts`
+  probes off-main — CGImageSource pixel dims, PDFKit `pageCount`, `AVURLAsset.load(.duration)`,
+  recursive folder size + child count, localized kind — plus `byteText` and `deltaText`
+  ("73% smaller" / "18% larger" / "same size"). Awaited from a SwiftUI `.task`.
+- **`FileTool.resultTitle`:** past-tense headlines (Compressed / Converted to JPEG / Resized Image /
+  Stitched PDFs / Video Compressed / …); non-producing tools fall back to `.title`.
+- **`FileToolActions` (`FileToolsMenu.swift`):** new `runFile(tool, original:) { op }` +
+  `presentFileResult(tool:original:output:)` — reveal output in Finder THEN
+  `vm.stage = .fileResult(...)` via `DispatchQueue.main.async { withAnimation {…} }` (stage-write
+  deferral invariant). Every file-producing `perform` case switched `run{}`→`runFile`; `performAsync`
+  (media) calls `presentFileResult` after export. Reveal/rename/move/info ops untouched.
+- **`OverlayView.swift`:** inner card switch routes `.fileResult` → **`FileResultView`** (single
+  column): resultTitle header + `CloseButton`, "RESULT" + `ExpandedFilePill(output, badge: delta,
+  accent)`, action row, "ORIGINAL" + `ExpandedFilePill(original)`, Spacer. `ExpandedFilePill` = the
+  file pill expanded **downward** into a kind/dimensions/pages/duration/items detail grid; draggable
+  out + click-to-Quick-Look like the header pill. `FileResultActionButton` = labelled glass pill.
+- **`AppDelegate.sizeForStage` `.fileResult`** → `CGSize(500, 430) * s` (430 for 2 detail grids;
+  bottom Spacer absorbs slack). Resize + tool-hotkey wiring already key off `$stage` generically.
+- **Build green** (no new warnings). **Owner manual-test owed:** compress → output+delta+original,
+  Reveal/Quick Look work, ← returns to chips, ✕ dismisses; image convert/resize shows dimensions;
+  pdf→images shows folder item count; a media op (extract audio / GIF) routes through the same stage.
+
+## 14. Session 2026-06-04 — clipboard history (menu submenu + ⌃⌘V picker)
+
+A lightweight clipboard manager. Owner forks (AskUserQuestion): **capture text + images + files**;
+**pick = copy-to-clipboard only** (no ⌘V synthesis — user presses ⌘V); **persist across restarts**;
+sensitive/concealed items always excluded. Suggested + approved hotkey: **⌃⌘V**.
+- **`Models/ClipboardHistoryStore.swift` (NEW):** `@MainActor ObservableObject` singleton. Polls
+  `NSPasteboard.general.changeCount` on a 0.5 s `.common`-mode `Timer`; on change builds a `ClipItem`
+  (file URLs → `.files`, else image → `.image` PNG sibling, else `.text`), newest-first, **cap 20**.
+  Skips sensitive types (`org.nspasteboard.ConcealedType`, `com.apple.is-sensitive`,
+  `org.nspasteboard.TransientType`, `org.nspasteboard.AutoGeneratedType`). Dedupe/move-to-front by a
+  relaunch-stable `signature` (`T:`text / `F:`paths / `I:`bytes×W×H); our own copy-backs skipped via
+  `ignoreChangeCount`. Persists `clipboard_history.json` + `clip_images/<uuid>.png` in App Support;
+  orphan PNGs deleted on trim/clear/remove. `copyToPasteboard(_:)` writes string / `[NSURL]` / TIFF back
+  and arms the ignore token. Gated by `clipboardHistoryEnabled` UserDefault (default on).
+- **`Core/GlobalHotkey.swift` (NEW):** thin Carbon `RegisterEventHotKey` wrapper (`register`/`unregister`
+  + free `hotkeyCallback` C trampoline → `MainActor.assumeIsolated` → stored closure; only a raw pointer
+  crosses the boundary). **Consumes** the keystroke (no leak to frontmost app), needs no Accessibility.
+- **`UI/ClipboardPickerView.swift` (NEW):** borderless `ClipboardPickerPanel` (`canBecomeKey`,
+  `.floating`, clear) + `ClipboardPicker.shared` controller (mirrors `QuickLookController`). Shows the
+  **10** newest as number-badge (1–9, 0→10th) + icon/thumbnail + 1-line preview + relative time; click
+  or number key → `copyToPasteboard` + hide. Local keyDown monitor claims digits/Esc while key, global
+  click monitor + `windowDidResignKey` dismiss. Liquid-glass, `@Environment(\.uiScale)`. Empty state.
+- **`AppDelegate.swift`:** `import Carbon.HIToolbox`; `clipboardHotkey = GlobalHotkey()`. Launch arms
+  poll + `registerClipboardHotkey()` (⌃⌘V → `ClipboardPicker.shared.toggle()`) when enabled.
+  `buildClipboardSubmenu()` = "Track Clipboard" checkbox + 20 rows (2-line attributed preview/time + 32-pt
+  icon; click `menuCopyClipItem`, ⌥-alt `menuRemoveClipItem`) + "Clear Clipboard History" + ⌃⌘V hint.
+  `menuToggleClipboard` flips capture **and** the hotkey together so they never drift.
+- **Gotcha (fixed):** the picker keyDown monitor must return `handleKey`'s result directly — the
+  `self?.handleKey(event) ?? event` form resurrects a swallowed key (nil → event) so digits/Esc would
+  leak to the app underneath. Guard `self`, then return the (possibly nil) result.
+- **Build green** (only pre-existing NSEvent-Sendable / `maxChars` warnings). **Owner manual-test owed:**
+  copy text/image/files → menu(20) + picker(10); ⌃⌘V opens picker, number-key + click copy, ⌘V pastes;
+  password-manager copy NOT captured; survives relaunch; "Track Clipboard" off stops capture + hotkey.

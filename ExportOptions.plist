@@ -1,0 +1,20 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <!-- Direct-download (Developer ID) distribution, not the App Store. -->
+    <key>method</key>
+    <string>developer-id</string>
+
+    <key>teamID</key>
+    <string>ASN2KAJ266</string>
+
+    <!-- Let Xcode pick the Developer ID Application cert + profiles. -->
+    <key>signingStyle</key>
+    <string>automatic</string>
+
+    <!-- Upload symbols are irrelevant for direct download; keep notarization clean. -->
+    <key>stripSwiftSymbols</key>
+    <true/>
+</dict>
+</plist>

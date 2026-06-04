@@ -166,8 +166,14 @@ async function handleComplete(request, env, ctx) {
   const tokensUsed =
     result.tokens && result.tokens > 0 ? result.tokens : Math.max(1, Math.ceil(totalChars / 4));
 
+  // Weight the raw tokens by the model ACTUALLY billed (incl. the fallback model) so the
+  // daily budget caps COST, not just count — a gemini-2.5-pro token drains it 4x faster,
+  // a flash-lite token only 0.5x. The SPEND roll-up below stays RAW (real prompt/completion
+  // tokens) for accurate $ math; ONLY this budget debit is weighted.
+  const billedTokens = Math.max(1, Math.round(tokensUsed * modelWeight(usedModel)));
+
   // Consume usage. Trial debits one interaction; post-trial debits this request's
-  // tokens against the daily budget (and bumps count for instrumentation).
+  // WEIGHTED tokens against the daily budget (and bumps count for instrumentation).
   if (inTrial) {
     await env.DB.prepare(
       "UPDATE accounts SET trial_used = trial_used + 1 WHERE device_id = ?"
@@ -176,7 +182,7 @@ async function handleComplete(request, env, ctx) {
     await env.DB.prepare(
       `INSERT INTO usage (device_id, day, count, tokens) VALUES (?, ?, 1, ?)
        ON CONFLICT(device_id, day) DO UPDATE SET count = count + 1, tokens = tokens + excluded.tokens`
-    ).bind(deviceId, day, tokensUsed).run();
+    ).bind(deviceId, day, billedTokens).run();
   }
   await env.DB.prepare(
     `INSERT INTO global_usage (day, count) VALUES (?, 1)
@@ -206,7 +212,7 @@ async function handleComplete(request, env, ctx) {
   else await spendWrite;
 
   const newTrial = inTrial ? trialUsed + 1 : trialUsed;
-  const newTokens = inTrial ? dailyTokens : dailyTokens + tokensUsed;
+  const newTokens = inTrial ? dailyTokens : dailyTokens + billedTokens;
   return json({
     text: result.text,
     usage: usagePayload(limits, isPro, newTrial, newTokens),
@@ -287,6 +293,30 @@ function estimateCost(model, promptTokens, completionTokens) {
   const p = PRICES[model];
   if (!p) return 0;
   return (promptTokens / 1e6) * p.in + (completionTokens / 1e6) * p.out;
+}
+
+// Budget weight per model — how fast a model drains the daily TOKEN budget, RELATIVE to
+// the default (flash = 1.0). This turns the budget into a COST guard, not just a raw token
+// count: gemini-2.5-pro costs ~4x flash and ~18x flash-lite per token, so an UNweighted
+// budget let a Pro user spam the pricey model "within budget" while the real bill ran away
+// (the worst-case ~$15–23/mo column). Weighting the debit by model makes the worst case
+// roughly flat regardless of which model gets used.
+//
+// Weights are deliberately GENEROUS — compressed well below the true cost ratio — so the
+// everyday experience is unchanged or better:
+//   flash-lite 0.5  → the cheap path is REWARDED (thrifty mode → ~2x effective headroom)
+//   flash      1.0  → the anchor; today's 30k/200k budgets keep their exact feel
+//   pro        4.0  → ≈ its $/token vs flash, so a Pro user maxing the premium model costs
+//                     about the same as one maxing flash (~$4/mo) instead of ~$15–23/mo.
+// Unknown/renamed model → 1.0 (never 0 — an unrecognised model must NOT be a free pass).
+const BUDGET_WEIGHTS = {
+  "gemini-2.5-flash-lite": 0.5,
+  "gemini-2.5-flash": 1.0,
+  "gemini-2.5-pro": 4.0,
+};
+function modelWeight(model) {
+  const w = BUDGET_WEIGHTS[model];
+  return Number.isFinite(w) && w > 0 ? w : 1.0;
 }
 
 function round4(n) {
@@ -371,6 +401,22 @@ function pickModel(env, tier, isPro = false) {
   // subscription. GEMINI_MODEL_EXTRA is OPTIONAL → unset falls back to `strong`
   // (flash), so enabling it never silently jumps to a pricier model.
   const extra = env.GEMINI_MODEL_EXTRA || strong;
+
+  // ── Thrifty mode (FREE tier only) ───────────────────────────────────────────
+  // ROUTING_MODE=thrifty squeezes the free ladder down a rung to protect the
+  // operator's bill as traffic grows: EVERY free request runs on flash-lite (the
+  // cheap model — and the always-on `reasoning_effort:"low"` still gives the more
+  // complex `strong` tasks a little thinking), and only the rare `extra`
+  // escalation steps up to flash for real reasoning. Pro is NEVER thrifted —
+  // paying users keep the full generous ladder below. Default "generous"
+  // preserves launch behaviour; flip the env var (no logic redeploy) to switch.
+  const thrifty = (env.ROUTING_MODE || "generous") === "thrifty";
+  if (thrifty && !isPro) {
+    if (tier === "extra") return strong; // flash — the one step-up free gets
+    return fast;                         // fast & strong (and any hint) → flash-lite
+  }
+
+  // ── Generous mode (default; also every Pro request) ─────────────────────────
   if (tier === "fast") return fast;
   // Free devices can't reach the top model — `extra` degrades to the capable default.
   if (tier === "extra") return isPro ? extra : strong;

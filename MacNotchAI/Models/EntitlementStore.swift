@@ -13,7 +13,7 @@ final class EntitlementStore: ObservableObject {
     /// The two "versions" the user picks between, plus the paid upgrade.
     enum Tier: String {
         case byok        // user's own API key — works today; later unlocks Pro for free
-        case freeHosted  // our hosted backend, metered (30 free → 10/day) — coming soon
+        case freeHosted  // our hosted backend, metered (10 free trial → daily token budget)
         case pro         // paid subscription, higher caps + better models — coming soon
     }
 

@@ -10,6 +10,23 @@ AI Drop is a native macOS menu-bar app that turns your physical notch into an AI
 
 ---
 
+## What's New in v0.9.9
+
+- **Favorite apps — "Open in" row** — Pick your go-to apps in **Settings → Favorite Tools**, then open any dropped file in them with a single click — or press **⌥1 … ⌥9**. The numbered row appears on both the action card and the result card.
+- **Clipboard history** — AI Drop now keeps your **last 20 clipboard items** (text, images, and files). Press **⌃⌘V** for a quick picker of the **last 10** — tap a number key or click an entry to copy it back, then **⌘V** to paste. The full 20 live in the menu bar under **Clipboard History** (⌥-click a row to remove just that one). Items from password managers (anything marked sensitive/concealed) are **never** captured, and your history survives a restart. Turn it off anytime with **Track Clipboard**.
+- **A local file toolbox — no uploads, no API key** — every file pill's **•••** menu now offers a large set of pure-Apple-framework tools that run entirely on your Mac:
+  - **PDF** — Export as Text · Split into Pages · Pages to Images · Stitch PDFs
+  - **Images** — Convert to JPEG · Convert to PDF · Resize / Compress · Remove Metadata (EXIF)
+  - **Video & audio** — Extract Audio · Transcribe · Convert to GIF · Extract Frame · Compress Video · Remove Audio · Convert to MP4 / MOV / M4A
+  - **Text, code & data** — Sort Lines · Remove Duplicate Lines · Count Lines / Words · SHA-256 Checksum · Base64 Encode / Decode · Pretty-Print / Minify JSON · CSV ⇄ JSON
+  - **Any file** — Compress to .zip · Show in Finder · Rename · Move to…
+- **Drop video & audio — even without an AI key** — media files are now first-class: drop one and you get the full utility toolbox and the Open-in row, no provider required.
+- **Quick Look on click** — click a file pill to preview it full-size (the familiar spacebar preview): images, PDFs, video, audio, text, and code.
+- **Result view for file tools** — when a tool creates a new file, AI Drop shows a result card placing the **new file next to the original**, with the size saved (e.g. "73 % smaller"), dimensions / pages / duration, and one-tap **Reveal in Finder** / **Quick Look**.
+- **New app icon** plus assorted animation and centering polish.
+
+---
+
 ## What's New in v0.9.8
 
 - **Session history** — AI Drop now remembers your last **10 sessions** (the file *and* the full AI conversation). Open the menu-bar icon → **Recent Sessions** to reopen any of them right where you left off. Hold **⌥** to remove a single session, or **Clear History** to wipe them all.

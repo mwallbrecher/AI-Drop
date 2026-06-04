@@ -191,7 +191,7 @@ struct OnboardingView: View {
             Text("AI Drop Free")
                 .font(.headline)
                 .padding(.top, 16)
-            Text("Start with 30 free interactions, then a daily allowance. No API key, no setup.")
+            Text("A free daily allowance, refreshed every day. No API key, no setup.")
                 .font(.caption)
                 .foregroundColor(.secondary)
         }

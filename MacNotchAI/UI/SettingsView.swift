@@ -1,25 +1,59 @@
 import SwiftUI
+import UniformTypeIdentifiers
+
+/// Which slice of the settings to show. The menu-bar dropdown opens the window
+/// scoped to a single setting (`.windowSize` / `.customPrompt` / `.favoriteTools` /
+/// `.aiProvider`); the system ⌘, Settings scene still shows everything (`.all`).
+enum SettingsSection: String {
+    case all, windowSize, customPrompt, favoriteTools, aiProvider
+
+    /// Title for the settings window when opened scoped to this section.
+    var windowTitle: String {
+        switch self {
+        case .all:           return "AI Drop Settings"
+        case .windowSize:    return "Window Size"
+        case .customPrompt:  return "Custom Prompts"
+        case .favoriteTools: return "Favorite Tools"
+        case .aiProvider:    return "AI Provider"
+        }
+    }
+}
 
 struct SettingsView: View {
+    /// Slice to render. `.all` (default) shows every section — used by the system
+    /// ⌘, scene. The menu items pass a single section to focus the window.
+    var section: SettingsSection = .all
+
     @AppStorage("selectedProvider") private var selectedProvider = AIProviderType.groq.rawValue
     @AppStorage("uiScale")          private var uiScaleRaw       = UIScale.small.rawValue
     @ObservedObject private var promptStore = PromptStore.shared
+    @ObservedObject private var toolsStore  = FavoriteToolsStore.shared
     @State private var apiKey = ""
     @State private var ollamaAvailable = false
     @State private var saved = false
     @State private var newCustomPrompt = ""
+    /// Which favorite-tools tab is showing. `.general` = the shared list; a category
+    /// case = that file type's own list (with its Use-General toggle).
+    @State private var favTab: FavTab = .general
+
+    /// Selection for the Favorite Tools tab picker.
+    private enum FavTab: Hashable {
+        case general
+        case category(FileCategory)
+    }
 
     private var selectedType: AIProviderType {
         AIProviderType(rawValue: selectedProvider) ?? .groq
     }
 
+    /// Whether a given section should render under the current scope.
+    private func shows(_ s: SettingsSection) -> Bool { section == .all || section == s }
+
     var body: some View {
         Form {
-            Section("Appearance") {
+            if shows(.windowSize) {
+            Section("Window Size") {
                 VStack(alignment: .leading, spacing: 12) {
-                    Text("Window Size")
-                        .font(.headline)
-
                     HStack(spacing: 10) {
                         ForEach(UIScale.allCases, id: \.rawValue) { scale in
                             let selected = uiScaleRaw == scale.rawValue
@@ -57,7 +91,9 @@ struct SettingsView: View {
                 }
                 .padding(.vertical, 4)
             }
+            }
 
+            if shows(.customPrompt) {
             Section(header: Text("Custom Prompts"),
                     footer: Text("These appear in the Custom tab when you drop a file. Tap one to run it against the file.")
                         .font(.caption2)
@@ -93,7 +129,28 @@ struct SettingsView: View {
                         .disabled(newCustomPrompt.trimmingCharacters(in: .whitespaces).isEmpty)
                 }
             }
+            }
 
+            if shows(.favoriteTools) {
+            Section(header: Text("Favorite Tools"),
+                    footer: Text("Drop a file, then open it in one of these apps with a click — or press ⌥1…⌥9. Up to 9 apps per list. Each file type can keep its own apps or use your General list.")
+                        .font(.caption2)
+                        .foregroundColor(.secondary)) {
+                Picker("", selection: $favTab) {
+                    Text("General").tag(FavTab.general)
+                    ForEach(FileCategory.allCases, id: \.self) { c in
+                        Text(c.title).tag(FavTab.category(c))
+                    }
+                }
+                .pickerStyle(.segmented)
+                .labelsHidden()
+                .padding(.bottom, 4)
+
+                favoriteToolsBody
+            }
+            }
+
+            if shows(.aiProvider) {
             Section(header: Text("AI Provider"),
                     footer: Text("* with average document sizes")
                         .font(.caption2)
@@ -173,6 +230,7 @@ struct SettingsView: View {
                 }
                 .task { ollamaAvailable = await isOllamaRunning() }
             }
+            }
         }
         .formStyle(.grouped)
         .frame(width: 420)
@@ -182,11 +240,90 @@ struct SettingsView: View {
         }
     }
 
+    /// Body of the Favorite Tools section for the selected tab. The General tab shows
+    /// just its list; a category tab shows a Use-General toggle, then either a note
+    /// (deferring) or that category's own editable list.
+    @ViewBuilder private var favoriteToolsBody: some View {
+        switch favTab {
+        case .general:
+            favoriteList(for: nil)
+        case .category(let c):
+            Toggle("Use General favorites", isOn: Binding(
+                get: { toolsStore.useGeneral(for: c) },
+                set: { toolsStore.setUseGeneral($0, for: c) }
+            ))
+            if toolsStore.useGeneral(for: c) {
+                Text("\(c.title) files use your General favorites.")
+                    .font(.caption)
+                    .foregroundColor(.secondary)
+            } else {
+                favoriteList(for: c)
+            }
+        }
+    }
+
+    /// The editable favorites list for a scope (`nil` = General): icon + name + ⌥N +
+    /// remove, drag-to-reorder, and an Add button capped at `maxTools`.
+    @ViewBuilder private func favoriteList(for category: FileCategory?) -> some View {
+        let tools = toolsStore.tools(for: category)
+        if tools.isEmpty {
+            Text("No favorite apps yet.")
+                .font(.caption)
+                .foregroundColor(.secondary)
+        } else {
+            ForEach(Array(tools.enumerated()), id: \.element.id) { index, tool in
+                HStack(spacing: 10) {
+                    Image(nsImage: toolsStore.icon(for: tool))
+                        .resizable()
+                        .frame(width: 22, height: 22)
+                    Text(tool.name)
+                        .font(.system(size: 13))
+                        .lineLimit(1)
+                    Spacer()
+                    Text("⌥\(index + 1)")
+                        .font(.system(size: 11, weight: .medium, design: .rounded))
+                        .foregroundColor(.secondary)
+                    Button(role: .destructive) {
+                        toolsStore.remove(tool, from: category)
+                    } label: {
+                        Image(systemName: "trash")
+                    }
+                    .buttonStyle(.borderless)
+                    .foregroundColor(.red)
+                    .help("Remove \(tool.name)")
+                }
+            }
+            .onMove { toolsStore.move(from: $0, to: $1, in: category) }
+        }
+
+        Button {
+            addTool(to: category)
+        } label: {
+            Label("Add App…", systemImage: "plus")
+        }
+        .disabled(toolsStore.tools(for: category).count >= FavoriteToolsStore.maxTools)
+    }
+
     private func addCustomPrompt() {
         let t = newCustomPrompt.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !t.isEmpty else { return }
         promptStore.addCustom(t)
         newCustomPrompt = ""
+    }
+
+    /// Pick a .app bundle to add to a favorites list (`nil` = General).
+    private func addTool(to category: FileCategory?) {
+        let panel = NSOpenPanel()
+        panel.title = "Choose an app"
+        panel.prompt = "Add"
+        panel.allowedContentTypes = [.application]
+        panel.allowsMultipleSelection = false
+        panel.canChooseDirectories = false
+        panel.canChooseFiles = true
+        panel.directoryURL = URL(fileURLWithPath: "/Applications")
+        if panel.runModal() == .OK, let url = panel.url {
+            toolsStore.add(appURL: url, to: category)
+        }
     }
 
     private func keychainService(for type: AIProviderType) -> String {

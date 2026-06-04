@@ -30,6 +30,31 @@ enum AIAction: String, CaseIterable, Identifiable {
 
     var id: String { rawValue }
 
+    /// SF Symbol shown to the left of the action in its menu-style row (the chips-stage
+    /// Suggested/Utilities lists + the result-stage Suggested rail / follow-ups). All
+    /// picked from symbols available on the macOS 14 deployment target.
+    var icon: String {
+        switch self {
+        case .summariseBullets:     return "list.bullet"
+        case .summariseShort:       return "text.alignleft"
+        case .extractKeyDates:      return "calendar"
+        case .extractKeyPoints:     return "list.number"
+        case .translateGerman:      return "globe"
+        case .translateFrench:      return "globe"
+        case .translateSpanish:     return "globe"
+        case .rephraseFormal:       return "briefcase"
+        case .rephraseCasual:       return "bubble.left"
+        case .explainCode:          return "chevron.left.forwardslash.chevron.right"
+        case .findBugs:             return "ladybug"
+        case .addDocstring:         return "text.quote"
+        case .refactor:             return "arrow.triangle.2.circlepath"
+        case .describeImage:        return "photo"
+        case .extractTextFromImage: return "doc.text.viewfinder"
+        case .generateAltText:      return "text.below.photo"
+        case .freeform:             return "sparkles"
+        }
+    }
+
     var systemPrompt: String {
         switch self {
         case .summariseBullets:
