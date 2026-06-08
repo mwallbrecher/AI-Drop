@@ -335,6 +335,7 @@ private struct ChipsColumnView: View {
     let closeNS: Namespace.ID
     @ObservedObject private var vm = OverlayViewModel.shared
     @ObservedObject private var store = PromptStore.shared
+    @ObservedObject private var outputStore = OutputDirectoryStore.shared
     @Environment(\.uiScale) private var scale
 
     // Inline "add custom prompt" composer state (Custom tab "+" row).
@@ -348,6 +349,10 @@ private struct ChipsColumnView: View {
     /// can't be made smaller/darker, so we hide it and draw our own.)
     @State private var scrollMetrics = ChipsScrollMetrics(offset: 0, contentHeight: 0)
     @FocusState private var customFieldFocused: Bool
+    // Utilities-tab inline output-path editing.
+    @State private var editingOutputPath = false
+    @State private var outputPathDraft = ""
+    @FocusState private var outputFieldFocused: Bool
 
     var body: some View {
         VStack(alignment: .leading, spacing: 10 * scale) {
@@ -542,6 +547,7 @@ private struct ChipsColumnView: View {
                         ForEach(store.history, id: \.self) { p in
                             ActionChip(title: p, isLoading: false) { runCustomPromptText(p) }
                         }
+                        clearAllRow(confirmClearPromptHistory)
                     }
                 case .custom:
                     ForEach(store.customPrompts, id: \.self) { p in
@@ -549,6 +555,8 @@ private struct ChipsColumnView: View {
                     }
                     customAddRow
                 case .utilities:
+                    // Output-folder control: where produced files land this session.
+                    outputDirRow
                     // Pillar 2: file-utility actions as chips (convert/rename/move/…),
                     // type-gated to the dropped file. Tapping runs the FileTools engine
                     // and confirms the macOS-native way (Finder reveal / NSAlert).
@@ -697,6 +705,163 @@ private struct ChipsColumnView: View {
         newCustom = ""
         withAnimation(.easeInOut(duration: 0.2)) { isAddingCustom = false }
     }
+
+    // MARK: - Utilities-tab output folder control
+
+    /// "Where do produced files go" control atop the Utilities tab. Shows the effective
+    /// output folder (session override → persisted store → "Same folder"); the folder button
+    /// opens the **Change Directory** dialog; the gear opens the Output Directory settings;
+    /// an × (when a folder is active) resets to same-folder for this session.
+    /// Output-folder control atop the Utilities tab. Shows the destination path (the active
+    /// override, or the file's own folder on the default) — **click it to edit the path inline**.
+    /// The folder button opens Finder right away; the gear opens the Output Directory settings;
+    /// an × (when overridden) resets to the file's folder for this session.
+    @ViewBuilder private var outputDirRow: some View {
+        let override = FileToolActions.effectiveOutputDir(for: fileURL)   // nil = default (file's folder)
+        let dir = override ?? fileURL.deletingLastPathComponent()
+        let display = (dir.path as NSString).abbreviatingWithTildeInPath
+        HStack(spacing: 6 * scale) {
+            if editingOutputPath {
+                TextField("Same folder as the file", text: $outputPathDraft)
+                    .textFieldStyle(.plain)
+                    .font(.system(size: 11.5 * scale, weight: .medium))
+                    .foregroundColor(.white)
+                    .focused($outputFieldFocused)
+                    .onSubmit { commitOutputPath() }
+                    .onExitCommand { editingOutputPath = false; outputFieldFocused = false }
+                    .onChange(of: outputFieldFocused) { _, focused in
+                        if !focused && editingOutputPath { commitOutputPath() }   // commit on blur
+                    }
+            } else {
+                Text(display)
+                    .font(.system(size: 11.5 * scale, weight: .medium))
+                    .foregroundColor(.white.opacity(override != nil ? 0.92 : 0.6))
+                    .lineLimit(1)
+                    .truncationMode(.middle)
+                    .help("Click to edit — \(dir.path)")
+                    .contentShape(Rectangle())
+                    .onTapGesture { beginEditingOutputPath(dir) }
+                if override != nil {
+                    Button { vm.sessionOutputOverride = .sibling } label: {
+                        Image(systemName: "xmark.circle.fill")
+                            .font(.system(size: 11 * scale))
+                            .foregroundColor(.white.opacity(0.4))
+                    }
+                    .buttonStyle(.plain)
+                    .help("Reset to the file’s folder for this session")
+                }
+            }
+            Spacer(minLength: 4 * scale)
+            Button(action: pickOutputFolder) {
+                Image(systemName: "folder.badge.plus")
+                    .font(.system(size: 12 * scale, weight: .medium))
+                    .foregroundColor(.white.opacity(0.75))
+            }
+            .buttonStyle(.plain)
+            .help("Choose output folder in Finder…")
+            Button { NotificationCenter.default.post(name: .showOutputDirectory, object: nil) } label: {
+                Image(systemName: "gearshape")
+                    .font(.system(size: 12 * scale))
+                    .foregroundColor(.white.opacity(0.55))
+            }
+            .buttonStyle(.plain)
+            .help("Output Directory settings")
+        }
+        .padding(.horizontal, 10 * scale)
+        .padding(.vertical, 8 * scale)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background(
+            RoundedRectangle(cornerRadius: 10 * scale, style: .continuous)
+                .fill(Color.white.opacity(0.05))
+                .overlay(RoundedRectangle(cornerRadius: 10 * scale, style: .continuous)
+                    .strokeBorder(Color.white.opacity(0.10), lineWidth: 0.5))
+        )
+    }
+
+    private func beginEditingOutputPath(_ dir: URL) {
+        outputPathDraft = dir.path
+        editingOutputPath = true
+        outputFieldFocused = true
+    }
+
+    /// Apply the inline-edited path: empty → same folder; a real folder → that folder; a path
+    /// ending in a (new) filename → its parent folder; otherwise beep and keep the current dir.
+    private func commitOutputPath() {
+        defer { editingOutputPath = false; outputFieldFocused = false }
+        let typed = outputPathDraft.trimmingCharacters(in: .whitespacesAndNewlines)
+        if typed.isEmpty { vm.sessionOutputOverride = .sibling; return }
+        let expanded = (typed as NSString).expandingTildeInPath
+        let fm = FileManager.default
+        var isDir: ObjCBool = false
+        if fm.fileExists(atPath: expanded, isDirectory: &isDir), isDir.boolValue {
+            vm.sessionOutputOverride = .folder(URL(fileURLWithPath: expanded))
+            return
+        }
+        // Not an existing directory — fall back to the parent if that's a real folder (so the
+        // user can edit the trailing name; producers derive the actual filename themselves).
+        let parent = (expanded as NSString).deletingLastPathComponent
+        if !parent.isEmpty, fm.fileExists(atPath: parent, isDirectory: &isDir), isDir.boolValue {
+            vm.sessionOutputOverride = .folder(URL(fileURLWithPath: parent))
+            return
+        }
+        NSSound.beep()
+    }
+
+    /// Open the Finder folder picker directly and set it as this session's output folder.
+    private func pickOutputFolder() {
+        let panel = NSOpenPanel()
+        panel.canChooseDirectories = true
+        panel.canChooseFiles = false
+        panel.allowsMultipleSelection = false
+        panel.prompt = "Choose"
+        panel.directoryURL = FileToolActions.effectiveOutputDir(for: fileURL)
+            ?? fileURL.deletingLastPathComponent()
+        NSApp.activate(ignoringOtherApps: true)
+        guard panel.runModal() == .OK, let url = panel.url else { return }
+        vm.sessionOutputOverride = .folder(url)
+    }
+
+    /// Subtle dashed, red-tinted destructive footer — mirrors `customAddRow`'s "+" pill.
+    private func clearAllRow(_ action: @escaping () -> Void) -> some View {
+        Button(action: action) {
+            HStack(spacing: 6 * scale) {
+                Image(systemName: "trash")
+                    .font(.system(size: 11 * scale, weight: .semibold))
+                Text("Clear All")
+                    .font(.system(size: 12 * scale, weight: .medium))
+            }
+            .foregroundColor(.red.opacity(0.85))
+            .padding(.horizontal, 14 * scale)
+            .padding(.vertical, 8 * scale)
+            .background(
+                Capsule(style: .continuous)
+                    .strokeBorder(style: StrokeStyle(lineWidth: 0.5, dash: [3, 3]))
+                    .foregroundColor(.red.opacity(0.35))
+            )
+        }
+        .buttonStyle(.plain)
+    }
+
+    /// Confirm-then-wipe the typed-prompt History tab (no undo).
+    private func confirmClearPromptHistory() {
+        guard confirmDestructive(title: "Clear Prompt History?") else { return }
+        withAnimation(.easeInOut(duration: 0.2)) { store.clearHistory() }
+    }
+}
+
+/// Shared modal confirm for destructive "Clear All" actions. Returns `true` only when
+/// the user picks the (first) destructive button. Mirrors AppDelegate's NSAlert pattern.
+@MainActor
+func confirmDestructive(title: String,
+                        confirmTitle: String = "Clear All") -> Bool {
+    let alert = NSAlert()
+    alert.messageText = title
+    alert.informativeText = "Are you sure? You can not undo this action."
+    alert.alertStyle = .warning
+    alert.addButton(withTitle: confirmTitle)
+    alert.addButton(withTitle: "Cancel")
+    NSApp.activate(ignoringOtherApps: true)
+    return alert.runModal() == .alertFirstButtonReturn
 }
 
 // MARK: - Stage 3: Two-column layout (GeometryReader rebuild)
@@ -1048,8 +1213,8 @@ private struct FileResultView: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: 12 * scale) {
-            // ── Header: past-tense tool title + close ────────────────────────
-            HStack(spacing: 8 * scale) {
+            // ── Header: tool title + actions (Reveal / Quick Look / Back) + close ─
+            HStack(spacing: 6 * scale) {
                 Image(systemName: tool.systemImage)
                     .font(.system(size: 13 * scale, weight: .semibold))
                     .foregroundColor(.white.opacity(0.85))
@@ -1057,29 +1222,25 @@ private struct FileResultView: View {
                     .font(.system(size: 14 * scale, weight: .semibold))
                     .foregroundColor(.white)
                     .lineLimit(1)
-                Spacer(minLength: 0)
+                    .truncationMode(.tail)
+                Spacer(minLength: 6 * scale)
+                FileResultIconButton(systemImage: "folder", help: "Reveal in Finder") {
+                    FileTools.revealInFinder([output])
+                }
+                FileResultIconButton(systemImage: "eye", help: "Quick Look") {
+                    QuickLookController.shared.present(urls: [output], current: 0)
+                }
+                FileResultIconButton(systemImage: "arrow.left", help: "Back") {
+                    withAnimation(.spring(response: 0.32, dampingFraction: 1.0)) {
+                        vm.returnToChips()
+                    }
+                }
                 CloseButton()
             }
 
             // ── Output (the new file) ────────────────────────────────────────
             sectionCaption("RESULT")
             ExpandedFilePill(url: output, facts: outFacts, badge: deltaText, accent: true)
-
-            // ── Actions ──────────────────────────────────────────────────────
-            HStack(spacing: 8 * scale) {
-                FileResultActionButton(systemImage: "folder", title: "Reveal in Finder") {
-                    FileTools.revealInFinder([output])
-                }
-                FileResultActionButton(systemImage: "eye", title: "Quick Look") {
-                    QuickLookController.shared.present(urls: [output], current: 0)
-                }
-                Spacer(minLength: 0)
-                FileResultActionButton(systemImage: "arrow.left", title: "Back") {
-                    withAnimation(.spring(response: 0.32, dampingFraction: 1.0)) {
-                        vm.returnToChips()
-                    }
-                }
-            }
 
             // ── Original (the source) ────────────────────────────────────────
             sectionCaption("ORIGINAL")
@@ -1213,37 +1374,32 @@ private struct ExpandedFilePill: View {
     }
 }
 
-/// Compact labelled action button for the utility result stage (Reveal / Quick Look / Back).
-private struct FileResultActionButton: View {
+/// Compact icon-only action button for the utility result header (Reveal / Quick Look / Back).
+/// Matches the minimize/close circular glass buttons so the header reads as one control cluster.
+private struct FileResultIconButton: View {
     let systemImage: String
-    let title: String
+    let help: String
     let action: () -> Void
     @State private var isHovered = false
     @Environment(\.uiScale) private var scale
 
     var body: some View {
         Button(action: action) {
-            HStack(spacing: 5 * scale) {
-                Image(systemName: systemImage)
-                    .font(.system(size: 10 * scale, weight: .semibold))
-                Text(title)
-                    .font(.system(size: 11 * scale, weight: .medium))
-            }
-            .foregroundColor(.white.opacity(isHovered ? 1.0 : 0.80))
-            .padding(.horizontal, 10 * scale)
-            .padding(.vertical, 6 * scale)
-            .background(
-                RoundedRectangle(cornerRadius: 8 * scale, style: .continuous)
-                    .fill(Color.white.opacity(isHovered ? 0.12 : 0.06))
-                    .overlay(
-                        RoundedRectangle(cornerRadius: 8 * scale, style: .continuous)
-                            .strokeBorder(Color.white.opacity(isHovered ? 0.22 : 0.12), lineWidth: 0.5)
-                    )
-            )
+            Image(systemName: systemImage)
+                .font(.system(size: 9 * scale, weight: .semibold))
+                .foregroundColor(.white.opacity(isHovered ? 1.0 : 0.75))
+                .frame(width: 22 * scale, height: 22 * scale)
+                .background(
+                    Circle()
+                        .fill(Color.white.opacity(isHovered ? 0.12 : 0.06))
+                        .overlay(Circle().strokeBorder(
+                            Color.white.opacity(isHovered ? 0.22 : 0.12), lineWidth: 0.5))
+                )
         }
         .buttonStyle(.plain)
         .onHover { isHovered = $0 }
         .animation(.easeInOut(duration: 0.12), value: isHovered)
+        .help(help)
     }
 }
 
@@ -1377,7 +1533,7 @@ private struct FileHeaderView: View {
                         )
                 }
                 .buttonStyle(.plain)
-                .help("Back to AI reply")
+                .help(cached.tag == 5 ? "Back to result" : "Back to AI reply")
                 .transition(.asymmetric(
                     insertion: .scale(scale: 0.7).combined(with: .opacity)
                                                .animation(.spring(response: 0.26, dampingFraction: 0.68)),

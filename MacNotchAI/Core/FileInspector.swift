@@ -1,7 +1,37 @@
 import Foundation
+import NaturalLanguage
 
 struct FileInspector {
+    /// Content-aware suggestions: start from the fixed extension map, then reorder/filter using
+    /// cheap LOCAL signals (`FileSignals.peek` — bounded text peek, no network/LLM). Falls back to
+    /// the plain `baseActions` list when there's nothing to read (media/unsupported, or peek fails).
     static func suggestedActions(for url: URL) -> [AIAction] {
+        let base = baseActions(for: url)
+        guard !base.isEmpty else { return base }
+        return reorder(base, using: cachedPeek(url), isProse: isProseFile(url))
+    }
+
+    // MARK: - Peek cache
+    //
+    // `suggestedActions` is recomputed on every SwiftUI body render (the result-stage Suggested
+    // rail calls it inside a `ForEach`), so the bounded content peek is memoised by path + mtime.
+    // All callers are @MainActor (stage writes + SwiftUI body on main), so a plain dictionary is
+    // safe — no locking needed.
+    private static var peekCache: [String: FileSignals.Signals] = [:]
+
+    private static func cachedPeek(_ url: URL) -> FileSignals.Signals {
+        let mtime = (try? url.resourceValues(forKeys: [.contentModificationDateKey]))?
+            .contentModificationDate?.timeIntervalSince1970 ?? 0
+        let key = "\(url.path)#\(mtime)"
+        if let hit = peekCache[key] { return hit }
+        let signals = FileSignals.peek(url)
+        if peekCache.count > 64 { peekCache.removeAll() }   // crude unbounded-growth guard
+        peekCache[key] = signals
+        return signals
+    }
+
+    /// The fixed extension → action mapping (no content inspection).
+    static func baseActions(for url: URL) -> [AIAction] {
         let ext = url.pathExtension.lowercased()
 
         switch ext {
@@ -32,21 +62,91 @@ struct FileInspector {
         }
     }
 
-    /// Returns the union of suggested actions for all given URLs, preserving the
-    /// order from the first URL and appending actions from subsequent URLs that
-    /// aren't already present.
+    /// Returns the union of suggested actions for all given URLs, preserving the order from the
+    /// first URL and appending actions from subsequent URLs that aren't already present, then
+    /// reordering by the PRIMARY (first) file's content signals — bounding the multi-file peek
+    /// cost to a single read.
     static func suggestedActions(forAll urls: [URL]) -> [AIAction] {
-        guard !urls.isEmpty else { return [] }
+        guard let primary = urls.first else { return [] }
         var seen = Set<AIAction>()
-        var result: [AIAction] = []
+        var union: [AIAction] = []
         for url in urls {
-            for action in suggestedActions(for: url) {
-                if seen.insert(action).inserted {
-                    result.append(action)
-                }
+            for action in baseActions(for: url) where seen.insert(action).inserted {
+                union.append(action)
             }
         }
-        return result
+        guard !union.isEmpty else { return union }
+        return reorder(union, using: cachedPeek(primary), isProse: isProseFile(primary))
+    }
+
+    // MARK: - Heuristic reorder
+
+    /// Stable reorder + light filter of `base` using local content `signals`. Rules are ordered so
+    /// the highest-priority signal runs LAST (each `moveToFront`/insert wins the #0 slot):
+    /// length → dates/money → translate-to-English. Never returns empty; deduped; capped ≤ 6.
+    static func reorder(_ base: [AIAction],
+                        using s: FileSignals.Signals,
+                        isProse: Bool) -> [AIAction] {
+        var actions = base
+
+        // Prose carrying a ``` code fence → make "Explain This Code" available.
+        if isProse, s.hasCodeFences, !actions.contains(.explainCode) {
+            actions.append(.explainCode)
+        }
+
+        // Length tuning (prose only).
+        if isProse {
+            if s.isShort {
+                actions.removeAll { $0 == .summariseBullets }   // too little to bullet
+            } else if s.isLong {
+                moveToFront(.summariseBullets, in: &actions)
+                moveToFront(.summariseShort,  in: &actions)     // ends up first
+            }
+        }
+
+        // Dates / money heavy → bubble extraction up (no-ops if those actions aren't present).
+        if s.hasManyDates || s.isMonetary {
+            moveToFront(.extractKeyPoints, in: &actions)
+            moveToFront(.extractKeyDates,  in: &actions)        // ends up first
+        }
+
+        // Non-English prose → lead with "Translate to English" and drop the to-<source> target.
+        if isProse, let lang = s.dominantLanguage, lang != .english {
+            if let sameTarget = translateAction(forSource: lang) {
+                actions.removeAll { $0 == sameTarget }
+            }
+            actions.removeAll { $0 == .translateEnglish }
+            actions.insert(.translateEnglish, at: 0)
+        }
+
+        var seen = Set<AIAction>()
+        let deduped = actions.filter { seen.insert($0).inserted }
+        let capped = Array(deduped.prefix(6))
+        return capped.isEmpty ? base : capped
+    }
+
+    private static func moveToFront(_ action: AIAction, in actions: inout [AIAction]) {
+        guard let idx = actions.firstIndex(of: action), idx != 0 else { return }
+        actions.remove(at: idx)
+        actions.insert(action, at: 0)
+    }
+
+    /// The "Translate to X" action whose target equals `lang` (so it can be dropped when we're
+    /// instead offering "Translate to English"). Only the three targets we ship.
+    private static func translateAction(forSource lang: NLLanguage) -> AIAction? {
+        switch lang {
+        case .german:  return .translateGerman
+        case .french:  return .translateFrench
+        case .spanish: return .translateSpanish
+        default:       return nil
+        }
+    }
+
+    /// Natural-language documents where translate / summarise / rephrase / length-tuning apply.
+    /// Deliberately excludes code & structured data (csv/json/xml) and media/images.
+    private static func isProseFile(_ url: URL) -> Bool {
+        ["pdf", "txt", "md", "markdown", "rtf", "docx", "doc", "pages"]
+            .contains(url.pathExtension.lowercased())
     }
 
     /// Returns true for file types AI Drop cannot process at all (archives, installers).
@@ -56,7 +156,7 @@ struct FileInspector {
     /// (Open-in + file utilities), so they are exempted here and land in the chips stage.
     static func isUnsupportedFileType(_ url: URL) -> Bool {
         if isMediaFile(url) { return false }
-        return suggestedActions(for: url).isEmpty
+        return baseActions(for: url).isEmpty   // emptiness only — skip the content peek
     }
 
     static func isImageFile(_ url: URL) -> Bool {

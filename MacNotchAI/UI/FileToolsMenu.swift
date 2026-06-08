@@ -62,6 +62,8 @@ enum FileToolActions {
 
         case .pdfToText:
             runFile(tool, original: fileURL) { try FileTools.exportPDFText(fileURL) }
+        case .pdfToMarkdown:
+            runFile(tool, original: fileURL) { try FileTools.exportPDFMarkdown(fileURL) }
 
         case .pdfSplit:
             runFile(tool, original: fileURL) { try FileTools.splitPDF(fileURL) }
@@ -114,10 +116,10 @@ enum FileToolActions {
         case .hashSHA256:
             runInfo(title: "SHA-256 — \(fileURL.lastPathComponent)") { try FileTools.sha256(fileURL) }
 
-        // Media ops are async — they must go through `performAsync`, not here.
+        // Async ops (media + Markdown→PDF) must go through `performAsync`, not here.
         case .extractAudio, .transcribe, .videoToGIF, .extractFrame, .compressVideo,
-             .muteVideo, .convertToMP4, .convertToMOV, .convertToM4A:
-            assertionFailure("media tool \(tool) must be dispatched via performAsync")
+             .muteVideo, .convertToMP4, .convertToMOV, .convertToM4A, .markdownToPDF:
+            assertionFailure("async tool \(tool) must be dispatched via performAsync")
         }
     }
 
@@ -137,9 +139,13 @@ enum FileToolActions {
             case .convertToMP4:  output = try await MediaTools.convertVideo(fileURL, to: .mp4, ext: "mp4")
             case .convertToMOV:  output = try await MediaTools.convertVideo(fileURL, to: .mov, ext: "mov")
             case .convertToM4A:  output = try await MediaTools.convertAudio(fileURL)
+            case .markdownToPDF: output = try await MarkdownPDF.export(fileURL)
             default:             return   // non-async tools go through `perform`
             }
-            if let output { presentFileResult(tool: tool, original: fileURL, output: output) }
+            if let output {
+                presentFileResult(tool: tool, original: fileURL,
+                                  output: relocate(output, original: fileURL))
+            }
         } catch {
             presentError(error)
         }
@@ -162,8 +168,32 @@ enum FileToolActions {
     /// `original` source, with a size delta). For multi-file ops (stitch / images→PDF)
     /// pass the primary file as `original`. Failures surface as an NSAlert.
     private static func runFile(_ tool: FileTool, original: URL, _ op: () throws -> URL) {
-        do { presentFileResult(tool: tool, original: original, output: try op()) }
+        do { presentFileResult(tool: tool, original: original, output: relocate(try op(), original: original)) }
         catch { presentError(error) }
+    }
+
+    // MARK: - Output directory
+
+    /// The effective output directory for `original` this session, or `nil` = "next to the
+    /// original" (the historical default). Session override wins over the persisted store.
+    static func effectiveOutputDir(for original: URL) -> URL? {
+        switch OverlayViewModel.shared.sessionOutputOverride {
+        case .sibling:          return nil                 // × reset → force same folder
+        case .folder(let url):  return url
+        case .inherit:          return OutputDirectoryStore.shared.resolved(
+                                          for: FileInspector.category(for: original))
+        }
+    }
+
+    /// Move a freshly-produced output into the configured directory (best-effort). Works
+    /// for single files AND the folder outputs of split / pdf→images. Returns the produced
+    /// file unchanged when no directory is set, it's already there, or the move fails.
+    private static func relocate(_ output: URL, original: URL) -> URL {
+        guard let dir = effectiveOutputDir(for: original) else { return output }
+        if output.deletingLastPathComponent().standardizedFileURL == dir.standardizedFileURL {
+            return output
+        }
+        return (try? FileTools.move(output, to: dir)) ?? output
     }
 
     /// Reveals `output` in Finder, then transitions the model to `.fileResult`. The

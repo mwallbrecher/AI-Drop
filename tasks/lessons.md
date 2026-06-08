@@ -401,3 +401,67 @@
 - **Rule:** "global shortcut that consumes the keystroke + no Accessibility" → Carbon RegisterEventHotKey.
   "observe our own app's keys, optionally swallow, no system scope" → `addLocalMonitorForEvents`.
   "observe other apps' keys, cannot swallow, needs Accessibility" → `addGlobalMonitorForEvents`.
+
+### [SUGG-01] Adding an `AIAction` case ripples into several exhaustive switches
+- **Context:** the heuristic smart-suggestions work added `AIAction.translateEnglish`. The build broke
+  at `ModelRouting.swift:63` ("switch must be exhaustive") — `AIAction.routing` switches on every case
+  with no `default`.
+- **Why:** `AIAction` is a fixed enum consumed by several **exhaustive** switches that deliberately omit
+  `default` so a new case forces a compile-time decision. Known sites: `AIAction.icon`, `.systemPrompt`
+  (both in `AIAction.swift`) and `.routing` (`ModelRouting.swift`).
+- **Fix:** add the new case to all three (icon, systemPrompt, routing tier). Build is the check.
+- **Rule:** when adding an `AIAction`, grep for `switch self`/`switch action` over `AIAction` and update
+  every exhaustive one. Other suggestion lists (`FileInspector.baseActions`, the follow-ups map in
+  `OverlayView.swift`) use `default`, so they compile without the new case but won't *surface* it until
+  you add it where wanted.
+
+### [SUGG-02] Content-aware suggestions must peek cheaply AND be memoised (body recompute)
+- **Context:** making `FileInspector.suggestedActions(for:)` content-aware meant reading file bytes. It's
+  called not just at drop time but inside a SwiftUI `ForEach` in the result-stage Suggested rail
+  (`OverlayView.leftColumn`), which re-evaluates on every body render.
+- **Why:** an un-memoised per-render file read (PDFKit first-page parse / 16 KB FileHandle read) on the
+  main thread would hitch the result UI.
+- **Fix:** `Core/FileSignals.peek` is hard-bounded (text → first 16 KB via `FileHandle.read(upToCount:)`;
+  PDF → first page only; else nothing) and `FileInspector` memoises it in a `peekCache` keyed by
+  `path#mtime`. All callers are @MainActor (stage writes + SwiftUI body), so a plain dictionary is safe.
+  `isUnsupportedFileType` uses `baseActions` (emptiness only) to skip the peek entirely.
+- **Rule:** if a function called from SwiftUI `body` touches the filesystem, bound the read AND cache it
+  (mtime-keyed); never let `body` trigger an unbounded or repeated file parse.
+
+### [OUTDIR-01] Redirect file-utility output by RELOCATING, not by threading a dir through producers
+- **Context:** the "Output Directory" feature needed every file-PRODUCING utility (≈15 in `FileTools`
+  + media in `MediaTools`) to write into a user-chosen folder instead of next to the original.
+- **Why not edit each producer:** each computes its own `url.deletingLastPathComponent()` output dir
+  inline — adding an `outputDir:` param to ~15 funcs is a huge, error-prone signature change, and some
+  are `async` / off-main (AVFoundation).
+- **Fix:** leave ALL producers untouched. They write the sibling as before and return the URL; the two
+  dispatch wrappers (`FileToolActions.runFile` + `performAsync`) then call `relocate(output, original:)`
+  = `try? FileTools.move(output, to: dir)` BEFORE `presentFileResult`. One resolver
+  (`effectiveOutputDir`) consults the session override then `OutputDirectoryStore`. `FileTools.move`
+  already dedupes and works on the folder outputs (split/pdf→images) too. Best-effort: on move failure
+  return the produced file where it is (never lose output).
+- **Rule:** to redirect where a pipeline's artifact lands, prefer a single post-production relocate at
+  the dispatch funnel over editing every producer. Mirror an existing per-category store
+  (`FavoriteToolsStore`) for the persisted General + per-`FileCategory` + `useGeneral` shape.
+- **Caveat:** the move runs on the main actor (dispatch funnel is `@MainActor`). Same-volume = instant
+  rename; a cross-volume output dir would copy+delete on main and could hitch for large media. Move it
+  off-main if that ever bites.
+
+### [PDF-MD-01] PDF→Markdown: use PDFPage.attributedString; detect bold by font NAME, not traits
+- **Context:** "Export as Markdown" needs structure (headings/bold/lists) that `PDFPage.string` throws
+  away. `PDFPage.attributedString` keeps it.
+- **Findings (verified with a standalone PDFKit probe):**
+  - **Font point SIZE round-trips reliably** → heading detection by size ratio (vs the doc's modal body
+    size) is the solid primary signal. `ratio≥1.7→#`, `≥1.35→##`, `≥1.22→###`.
+  - **`NSFont.fontDescriptor.symbolicTraits.contains(.bold)` is UNRELIABLE through a PDF** — PDFs encode
+    weight in the font NAME (e.g. "Times-Bold"), not as a trait. Detect bold by sniffing the font name
+    (`bold`/`black`/`heavy`/`semibold`) and the descriptor's numeric `.weight ≥ 0.4`, not just traits.
+    (System-font synthetic test PDFs flatten bold entirely via the headless `.SFNS`→Times fallback —
+    a misleading test; real Word/LaTeX/Pages PDFs carry named bold faces.)
+  - **Reading order:** `attributedString` is in reading order for well-formed PDFs. A synthetic PDF drawn
+    into a `flipped:true` CGContext comes back REVERSED — a test artifact, not an app bug. Verify by
+    printing `attr.string` order, and generate test PDFs line-by-line top-down in native (non-flipped)
+    coords.
+- **Rule:** structure from font SIZE (trustworthy) + emphasis from font NAME/weight (traits lie). Tables
+  are out of reach locally — degrade to paragraphs. Validate PDF heuristics with a real top-down PDF, not
+  a flipped-context synthetic one.

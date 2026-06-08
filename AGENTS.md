@@ -1,6 +1,7 @@
 # AGENTS.md
 
-This file provides guidance to Codex (Codex.ai/code) when working with code in this repository.
+This file provides guidance to coding agents (Claude Code, Codex, Cursor, etc.) when working with
+code in this repository. It is the single source of truth — there is no separate `CLAUDE.md`.
 
 > The original "build-from-scratch" master brief was moved to `docs/ORIGINAL_BRIEF.md`.
 > It is historical — the shipping app has diverged significantly from it. Trust the code, not the brief.
@@ -28,7 +29,7 @@ open MacNotchAI.xcodeproj
   and exercising the app manually (drag a file, drop, run an action).
 - The app is **non-sandboxed** (`ENABLE_APP_SANDBOX = NO`) and requires **Accessibility permission**
   for its global `NSEvent` monitors (Escape key, outside-click). First launch prompts for it.
-- `MACOSX_DEPLOYMENT_TARGET = 26.0`, Swift 5, hardened runtime on. The mic entitlement
+- `MACOSX_DEPLOYMENT_TARGET = 14.0`, Swift 5, hardened runtime on. The mic entitlement
   (`com.apple.security.device.audio-input`) in `MacNotchAI.entitlements` is mandatory for dictation.
 - Editing `project.pbxproj` programmatically: it is **tab-indented**. String edits with spaces will
   silently fail to match (see `tasks/lessons.md` [BUILD-01]).
@@ -40,9 +41,12 @@ four files in order explains 90% of the app: `AppDelegate.swift` → `Models/Ove
 `UI/OverlayView.swift` → `UI/DroppableHostingView.swift`.
 
 **Stage state machine.** `OverlayViewModel.shared` (singleton, `@MainActor`) holds `stage`:
-`waitingForDrop → chips → loading → result` (plus `error`). AppDelegate writes drag state into it;
-`OverlayView` reads it and renders the matching stage. This is the single source of truth — almost
-every behavior flows through it.
+`waitingForDrop → chips → loading → result` (plus `error`, and `fileResult` — the utility
+"second result stage", see Pillar 2). AppDelegate writes drag state into it; `OverlayView` reads it
+and renders the matching stage. This is the single source of truth — almost every behavior flows
+through it. The root `OverlayView.body` splits on `.waitingForDrop` (bare pill) vs `default:` (glass
+card); an **inner** switch then routes the card's content: `.chips`→ChipsColumnView,
+`.loading/.result/.error`→TwoColumnView, `.fileResult`→FileResultView.
 
 **Three event sources feed the model:**
 1. `DragMonitor.shared` — global `.leftMouseDragged` / mouseDown / mouseUp monitors + a `.common`-mode
@@ -62,14 +66,84 @@ fixed `CGSize` per stage and calls `OverlayWindow.animateTo`. The window resizes
 `OpenAICompatibleResponse`; Anthropic has its own. `resolveProvider()` (bottom of `AppDelegate.swift`)
 reads the `selectedProvider` UserDefault and pulls the key from Keychain. `HandoffManager` is a
 separate path: it copies context to the clipboard and opens the provider's native app/web URL
-("Continue in Codex/ChatGPT").
+("Continue in Claude/ChatGPT").
 
 **Content extraction.** `FileContentExtractor` reads PDF (PDFKit, 20 pages / 12k chars) and UTF-8
-text/code; images are passed through as a URL to vision models. `FileInspector` maps extension →
-suggested `AIAction`s and flags unsupported types. Multi-file sessions concatenate extracted text
-(see `buildMultiFileContent` in `OverlayView.swift`). Other notable pieces: `SpeechRecognizer` (native
+text/code; images are passed through as a URL to vision models. `FileInspector.baseActions(for:)` maps
+extension → suggested `AIAction`s and flags unsupported types; `suggestedActions(for:)` then makes that
+list **content-aware** via `reorder(_:using:)` driven by `Core/FileSignals.swift` — a **bounded,
+synchronous, local** peek (first ~16 KB of text/code, or a PDF's first page) yielding `{language,
+hasManyDates, isShort, isLong, hasCodeFences, isMonetary}`. Heuristics-only (no LLM/tokens/network):
+non-English prose leads with "Translate to English" (drops the to-<source> target), date/money-heavy
+docs bubble Extract Key Dates/Points, short text drops "Summarise into Bullets", long text leads with
+summarise, a ``` fence in prose adds "Explain This Code". Result deduped, capped ≤ 6, never empty; any
+peek failure falls back to `baseActions`. The peek is memoised by path+mtime (`peekCache`) because the
+result-stage Suggested rail recomputes it inside a SwiftUI `ForEach`. Multi-file sessions concatenate
+extracted text (see `buildMultiFileContent` in `OverlayView.swift`). Other notable pieces:
+`SpeechRecognizer` (native
 on-device dictation for the prompt field), `HotkeyManager` (optional modifier gate for the pill),
 `MarkdownText` (lightweight Markdown renderer for results).
+
+**Favorite-tools launch row (Pillar 1).** `FavoriteToolsStore.shared` (Codable array in UserDefaults,
+capped 9) holds the user's favorite apps. `UI/ToolRow.swift` renders a numbered "Open in" row in **both**
+the `.chips` stage and the `.result` stage (bottom-left of the result left column) — the **same**
+`ToolRow` view, so styling is identical. Clicking a tile — or pressing `Option+1…9` — calls
+`FavoriteToolsStore.launch(_:with:)` (`NSWorkspace.open(_:withApplicationAt:…)`) on **all** staged files
+(`OverlayViewModel.sessionFileURLs`). The launched app is activated but the notch session is left
+**open** (user dismisses manually). A trailing dashed **"+"** tile (`AddToolButton`) posts
+`.showFavoriteTools` → `showSettings(section: .favoriteTools)` to add an app. The hotkeys are a local
+`NSEvent` keyDown monitor (`AppDelegate.startToolHotkeys`/`handleToolHotkey`, run via
+`MainActor.assumeIsolated`) — installed when `stage` becomes `.chips` **or** `.result`, removed
+otherwise; it swallows only a matched bare-`Option+N` and passes every other key through to the prompt
+field. Configured in the "Favorite Tools" section of `SettingsView` (`NSOpenPanel`, `.application`).
+Chips-window height adds `ChipsLayout.toolRowHeight`/`.toolHintHeight` in `AppDelegate.sizeForStage`; in
+the result stage the row sits below a `Spacer` and consumes existing slack (no height-math change).
+
+**File utilities + the utility result stage (Pillar 2).** `Core/FileTools.swift` (`FileTools` engine +
+`FileTool` catalogue) runs pure-Apple-framework file ops; every producer writes a deduped sibling and
+returns the new `URL`. **Output directory (configurable):** producers always write the sibling, then
+`FileToolActions.runFile`/`performAsync` **relocate** it via `relocate(_:original:)` →
+`try? FileTools.move(output, to: dir)` before presenting. `effectiveOutputDir(for:)` resolves
+`OverlayViewModel.sessionOutputOverride` (`.inherit`/`.sibling`/`.folder`, tri-state, reset on
+`reset()`) → else `OutputDirectoryStore.shared.resolved(for: category)` → else nil = sibling (default).
+`Models/OutputDirectoryStore.swift` mirrors `FavoriteToolsStore` (General path + per-`FileCategory`
+path + `useGeneral`, JSON in UserDefaults `outputDirectory.v1`). UI: the Utilities tab's `outputDirRow`
+(folder name + × reset + Change… `NSOpenPanel` + two "Remember" checkboxes persisting to General /
+category + a gear → `.showOutputDirectory`), and a Settings **Output Directory** section
+(`SettingsSection.outputDirectory`, same shape as Favorite Tools). `UI/FileToolsMenu.swift`
+(`FileToolActions`) dispatches them: file-PRODUCING ops
+go through `runFile`/`presentFileResult` (reveal the output in Finder, then set
+`stage = .fileResult(original:output:tool:)` — deferred one tick + `withAnimation`); async media ops do
+the same after their export; **rename / move / Count / SHA-256 are unchanged** (in-place remap, or an
+NSAlert with Copy). `Stage.fileResult` renders **`FileResultView`** (single column, 500×430 in
+`sizeForStage`): a past-tense `FileTool.resultTitle` header, then the output and original each as an
+`ExpandedFilePill` (icon + name + size, expanded downward into a kind/dimensions/pages/duration/items
+detail grid), with a size-delta capsule on the output ("73% smaller") and Reveal-in-Finder / Quick Look /
+← back (`vm.returnToChips()`) actions. `returnToChips()` stashes the `.fileResult` into `cachedResult`
+(mirroring the AI path's `navigateBackToChips`), so the chips header's **→ button** (`vm.stage.tag == 1
+&& cachedResult != nil`) restores the utility result without re-running the tool — same control the AI
+reply uses. Facts come from **`Core/FileFacts.swift`** — a `nonisolated`, `Sendable`
+`FileFacts.gather(_:) async` that probes off-main (CGImageSource dims, PDFKit pages,
+`AVURLAsset.load(.duration)`, recursive folder size/count) and is awaited from a `.task`. Both
+`remapSessionURL` switches (stage + `cachedResult`) carry the `.fileResult` case so a rename remaps both URLs.
+
+**Clipboard history.** `Models/ClipboardHistoryStore.shared` (`@MainActor ObservableObject`) polls
+`NSPasteboard.general.changeCount` on a 0.5 s `.common`-mode `Timer` and records each new copy
+(text / image / file URLs), newest-first, capped at **20**. Sensitive/transient pasteboard types
+(`org.nspasteboard.ConcealedType`, `com.apple.is-sensitive`, `org.nspasteboard.TransientType`,
+`org.nspasteboard.AutoGeneratedType` — password managers set these) are **never** captured. Items dedupe
+by a relaunch-stable `signature` (`T:`/`F:`/`I:…`); our own copy-backs are skipped via `ignoreChangeCount`.
+Persists as `clipboard_history.json` + sibling PNGs in `clip_images/` under App Support. Surfaced **two**
+ways: the menu-bar **"Clipboard History"** submenu (last 20, `AppDelegate.buildClipboardSubmenu`; row
+copies back, ⌥-alt removes; plus a "Track Clipboard" checkbox) and the **⌃⌘V picker popup**
+(`UI/ClipboardPickerView.swift`, last 10). Picking an item only **copies it back** to the pasteboard
+(`copyToPasteboard` — the user then presses ⌘V; we never synthesise keystrokes). The picker is a
+borderless `ClipboardPickerPanel` (`canBecomeKey`, `.floating`, liquid-glass) driven by the
+`ClipboardPicker.shared` controller (mirrors `QuickLookController`): a local keyDown monitor claims the
+digit keys (1–9, 0 → 10th) + Esc while it's key, a global click monitor + `windowDidResignKey` dismiss.
+The system-wide **⌃⌘V** is a Carbon `RegisterEventHotKey` (`Core/GlobalHotkey.swift`) — it **consumes**
+the keystroke (no leak to the frontmost app) and needs **no** Accessibility. Capture + hotkey are armed
+together at launch and flipped together by the "Track Clipboard" toggle, gated on `clipboardHistoryEnabled`.
 
 ## Critical invariants — do not break these
 
@@ -103,7 +177,8 @@ These encode hard-won crash fixes. Violating them reintroduces `EXC_BREAKPOINT` 
 - **Keychain services** are `com.aidrop.{groq,anthropic,openai,ollama}` (note: *aidrop*, not the bundle
   id). API keys never go in UserDefaults.
 - **UserDefaults keys in use:** `selectedProvider`, `uiScale`, `hasCompletedOnboarding`,
-  `disabledUntil`, `pref.chipsExpanded`, `pref.followupsExpanded`, plus the hotkey keys.
+  `disabledUntil`, `pref.chipsExpanded`, `pref.followupsExpanded`, `clipboardHistoryEnabled`, plus the
+  hotkey keys.
 - **Concurrency:** classes are `@MainActor`; do not bridge state *binding* writes through
   `DispatchQueue.main.async` under strict isolation — use `Task { @MainActor }` or call directly
   (lessons CONC-01). Audio-tap callbacks must capture the request locally, never `self`.
@@ -126,9 +201,12 @@ These encode hard-won crash fixes. Violating them reintroduces `EXC_BREAKPOINT` 
 - README advertises **DOCX** support; `FileContentExtractor` does **not** implement it (no zip/XML
   parse) — `.docx` currently falls through to a UTF-8 read and will fail. Treat that README row as
   aspirational.
-- Deployment target is **macOS 26.0** — the app won't launch on anything older despite the README
-  saying "macOS 13+". Lowering it requires `@available` guards (some paths are macOS-26-specific, see
-  lessons MIC-05).
+- Deployment target is **macOS 14.0** (lowered from 26.0, 2026-06-01). The code compiles clean at 14
+  with no `@available` guards needed (the "Liquid Glass" look is custom `NSVisualEffectView`, not the
+  26-only `glassEffect` API). The **mic permission path is OS-branched** (`SpeechRecognizer`,
+  `if #available(macOS 26)`): 26 → `AVCaptureDevice`, 14/15 → `AVAudioApplication` (lessons MIC-04/05/11).
+  ⚠️ The 14/15 mic branch is **runtime-UNVERIFIED** — built from the documented lessons, but no 14/15
+  test machine was available. The macOS 26 path is unchanged and verified.
 - **App Store note:** the Mac App Store requires the App Sandbox, which is incompatible with this app's
   global event monitoring + Accessibility model. App Store distribution is an open architectural
   question — see `tasks/todo.md`.

@@ -120,6 +120,191 @@ enum FileTools {
         return target
     }
 
+    // MARK: PDF → Markdown
+
+    /// Converts a PDF to Markdown using PDFKit's per-page `attributedString` (which carries
+    /// font size + bold/italic — unlike `.string`). Font-size jumps → headings, traits →
+    /// **bold** / _italic_, line prefixes → lists, blank lines → paragraph breaks. Pure and
+    /// local (no network, no LLM). Tables / exotic layouts degrade to plain paragraphs; a
+    /// page with no text layer (scanned) falls back to its raw `.string`. Writes a sibling `.md`.
+    @discardableResult
+    static func exportPDFMarkdown(_ url: URL) throws -> URL {
+        guard let doc = PDFDocument(url: url) else { throw FileToolError.pdfUnreadable(url) }
+        guard doc.pageCount > 0 else { throw FileToolError.pdfEmpty(url) }
+
+        var pages: [String] = []
+        for i in 0..<doc.pageCount {
+            guard let page = doc.page(at: i) else { continue }
+            if let attr = page.attributedString, attr.length > 0 {
+                let md = markdownFromAttributed(attr)
+                if !md.isEmpty { pages.append(md) }
+            } else if let s = page.string?.trimmingCharacters(in: .whitespacesAndNewlines), !s.isEmpty {
+                pages.append(s)   // no text layer (scanned) — plain-text fallback
+            }
+        }
+
+        let body = pages.joined(separator: "\n\n").trimmingCharacters(in: .whitespacesAndNewlines)
+        let target = uniqueDestination(url.deletingPathExtension().appendingPathExtension("md"))
+        do { try (body + "\n").write(to: target, atomically: true, encoding: .utf8) }
+        catch { throw FileToolError.writeFailed(error.localizedDescription) }
+        return target
+    }
+
+    // ── Markdown conversion helpers ──────────────────────────────────────────
+
+    private static let bulletChars: Set<Character> = ["•", "‣", "◦", "▪", "⁃", "·", "-", "–", "—", "*"]
+
+    private static func isBullet(_ s: String) -> Bool {
+        guard let first = s.first, bulletChars.contains(first) else { return false }
+        let next = s.dropFirst().first
+        return next == " " || next == "\t"
+    }
+
+    private static func isNumbered(_ s: String) -> Bool {
+        var idx = s.startIndex
+        var sawDigit = false
+        while idx < s.endIndex, s[idx].isNumber { sawDigit = true; idx = s.index(after: idx) }
+        guard sawDigit, idx < s.endIndex, s[idx] == "." || s[idx] == ")" else { return false }
+        idx = s.index(after: idx)
+        return idx < s.endIndex && (s[idx] == " " || s[idx] == "\t")
+    }
+
+    /// Normalise a detected list line: numbered → "n. text", bullet → "- text".
+    private static func normalizeList(_ line: String) -> String {
+        if isNumbered(line) {
+            var idx = line.startIndex
+            while idx < line.endIndex, line[idx].isNumber { idx = line.index(after: idx) }
+            let num = line[line.startIndex..<idx]
+            let rest = line[line.index(after: idx)...].trimmingCharacters(in: .whitespaces)
+            return "\(num). \(rest)"
+        }
+        return "- " + line.dropFirst().trimmingCharacters(in: .whitespaces)
+    }
+
+    /// Bold/italic for a PDF font. `symbolicTraits` is unreliable through a PDF round-trip
+    /// (PDFs encode weight in the font NAME, e.g. "Times-Bold", not as a trait), so also
+    /// sniff the font name and the descriptor's numeric weight.
+    private static func fontEmphasis(_ font: NSFont?) -> (bold: Bool, italic: Bool) {
+        guard let font else { return (false, false) }
+        let traits = font.fontDescriptor.symbolicTraits
+        var bold = traits.contains(.bold)
+        var italic = traits.contains(.italic)
+        let name = font.fontName.lowercased()
+        if !bold, name.contains("bold") || name.contains("black")
+            || name.contains("heavy") || name.contains("semibold") { bold = true }
+        if !italic, name.contains("italic") || name.contains("oblique") { italic = true }
+        if !bold,
+           let t = font.fontDescriptor.object(forKey: .traits) as? [NSFontDescriptor.TraitKey: Any],
+           let w = t[.weight] as? CGFloat, w >= 0.4 { bold = true }
+        return (bold, italic)
+    }
+
+    /// Build the inline Markdown for a line, wrapping bold/italic runs. Headings skip
+    /// emphasis (they're already strong). Preserves inter-run spacing.
+    private static func inlineText(_ attr: NSAttributedString, _ range: NSRange, heading: Bool) -> String {
+        let ns = attr.string as NSString
+        var result = ""
+        attr.enumerateAttributes(in: range, options: []) { attrs, sub, _ in
+            let piece = ns.substring(with: sub).replacingOccurrences(of: "\n", with: " ")
+            let core = piece.trimmingCharacters(in: .whitespaces)
+            if core.isEmpty { if !piece.isEmpty { result += " " }; return }
+            if heading { result += piece; return }
+            let (bold, italic) = fontEmphasis(attrs[.font] as? NSFont)
+            let lead = String(piece.prefix(while: { $0 == " " }))
+            let trail = String(piece.reversed().prefix(while: { $0 == " " }))
+            var wrapped = core
+            if bold && italic { wrapped = "***\(wrapped)***" }
+            else if bold      { wrapped = "**\(wrapped)**" }
+            else if italic    { wrapped = "_\(wrapped)_" }
+            result += lead + wrapped + trail
+        }
+        return result.trimmingCharacters(in: .whitespaces)
+    }
+
+    /// Convert one page's attributed string to Markdown via font-size + trait heuristics.
+    private static func markdownFromAttributed(_ attr: NSAttributedString) -> String {
+        let fullRange = NSRange(location: 0, length: attr.length)
+
+        // Body font size = the most common point size (weighted by characters).
+        var sizeWeight: [Int: Int] = [:]
+        attr.enumerateAttribute(.font, in: fullRange, options: []) { value, range, _ in
+            let size = Int((((value as? NSFont)?.pointSize) ?? 12).rounded())
+            sizeWeight[size, default: 0] += range.length
+        }
+        let bodySize = CGFloat(sizeWeight.max { $0.value < $1.value }?.key ?? 12)
+
+        enum Block { case heading(Int, String); case para(String); case list(String) }
+        var blocks: [Block] = []
+        var paraBuf: [String] = []
+        func flushPara() {
+            let joined = paraBuf.joined(separator: " ").trimmingCharacters(in: .whitespaces)
+            if !joined.isEmpty { blocks.append(.para(joined)) }
+            paraBuf.removeAll()
+        }
+
+        let ns = attr.string as NSString
+        ns.enumerateSubstrings(in: fullRange, options: [.byLines]) { sub, lineRange, _, _ in
+            let line = (sub ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
+            if line.isEmpty { flushPara(); return }
+
+            // Line metrics: largest font + whether the whole line is bold.
+            var maxSize: CGFloat = 0
+            var allBold = true
+            var sawFont = false
+            attr.enumerateAttribute(.font, in: lineRange, options: []) { value, _, _ in
+                guard let f = value as? NSFont else { allBold = false; return }
+                sawFont = true
+                maxSize = max(maxSize, f.pointSize)
+                if !fontEmphasis(f).bold { allBold = false }
+            }
+            if !sawFont { allBold = false; maxSize = bodySize }
+            let ratio = maxSize / max(bodySize, 1)
+
+            if isBullet(line) || isNumbered(line) {
+                flushPara()
+                blocks.append(.list(normalizeList(line)))
+                return
+            }
+
+            // Heading: clearly larger text, or a short all-bold line that isn't a sentence.
+            let isHeading = ratio >= 1.22
+                || (allBold && line.count <= 80 && ratio >= 1.04 && !line.hasSuffix("."))
+            if isHeading {
+                flushPara()
+                let level = ratio >= 1.7 ? 1 : (ratio >= 1.35 ? 2 : 3)
+                blocks.append(.heading(level, inlineText(attr, lineRange, heading: true)))
+                return
+            }
+
+            paraBuf.append(inlineText(attr, lineRange, heading: false))   // reflow wrapped lines
+        }
+        flushPara()
+
+        // Render — headings/paragraphs separated by a blank line; consecutive list items
+        // grouped into one tight block.
+        var out: [String] = []
+        var prevListKind: String? = nil   // "b" bullet / "n" numbered — group same-kind items
+        for block in blocks {
+            switch block {
+            case .heading(let lvl, let t):
+                out.append(String(repeating: "#", count: lvl) + " " + t)
+                prevListKind = nil
+            case .para(let t):
+                out.append(t)
+                prevListKind = nil
+            case .list(let t):
+                let kind = t.hasPrefix("- ") ? "b" : "n"
+                if prevListKind == kind, let last = out.last {
+                    out[out.count - 1] = last + "\n" + t
+                } else {
+                    out.append(t)
+                }
+                prevListKind = kind
+            }
+        }
+        return out.joined(separator: "\n\n").trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
     // MARK: Stitch PDFs
 
     /// Merges every PDF in `urls` (in the given order) into one new PDF written next
@@ -738,6 +923,8 @@ enum FileTool: Identifiable, Hashable {
     case rename
     case move
     case pdfToText
+    case pdfToMarkdown
+    case markdownToPDF
     case pdfSplit
     case pdfToImages
     case stitchPDFs
@@ -776,7 +963,7 @@ enum FileTool: Identifiable, Hashable {
     var isAsync: Bool {
         switch self {
         case .extractAudio, .transcribe, .videoToGIF, .extractFrame, .compressVideo,
-             .muteVideo, .convertToMP4, .convertToMOV, .convertToM4A:
+             .muteVideo, .convertToMP4, .convertToMOV, .convertToM4A, .markdownToPDF:
             return true
         default:
             return false
@@ -789,6 +976,8 @@ enum FileTool: Identifiable, Hashable {
         case .rename:        return "Rename…"
         case .move:          return "Move to…"
         case .pdfToText:     return "Export as .txt"
+        case .pdfToMarkdown: return "Export as Markdown"
+        case .markdownToPDF: return "Export as PDF"
         case .pdfSplit:      return "Split into Pages"
         case .pdfToImages:   return "Pages to Images"
         case .stitchPDFs:    return "Stitch PDFs"
@@ -826,6 +1015,8 @@ enum FileTool: Identifiable, Hashable {
     var resultTitle: String {
         switch self {
         case .pdfToText:     return "Exported as Text"
+        case .pdfToMarkdown: return "Exported as Markdown"
+        case .markdownToPDF: return "Exported as PDF"
         case .pdfSplit:      return "Split into Pages"
         case .pdfToImages:   return "Pages to Images"
         case .stitchPDFs:    return "Stitched PDFs"
@@ -863,6 +1054,8 @@ enum FileTool: Identifiable, Hashable {
         case .rename:        return "pencil"
         case .move:          return "arrow.right.doc.on.clipboard"
         case .pdfToText:     return "doc.plaintext"
+        case .pdfToMarkdown: return "doc.richtext"
+        case .markdownToPDF: return "arrow.up.doc"
         case .pdfSplit:      return "scissors"
         case .pdfToImages:   return "photo.stack"
         case .stitchPDFs:    return "doc.on.doc"
@@ -899,6 +1092,7 @@ enum FileTool: Identifiable, Hashable {
         let ext = url.pathExtension.lowercased()
         if ext == "pdf" {
             list.append(.pdfToText)
+            list.append(.pdfToMarkdown)
             list.append(.pdfSplit)
             list.append(.pdfToImages)
             // Stitch is always offered for a PDF; the menu disables it (with a hover
@@ -919,6 +1113,9 @@ enum FileTool: Identifiable, Hashable {
         }
         if ext == "csv" {
             list.append(.csvToJSON)
+        }
+        if ext == "md" || ext == "markdown" {
+            list.append(.markdownToPDF)
         }
         // Text / code / data (batch 3): line tools + Base64 — synchronous, zero API cost.
         if FileInspector.isTextFile(url) {

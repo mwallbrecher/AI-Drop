@@ -85,6 +85,10 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             self, selector: #selector(handleShowFavoriteTools),
             name: .showFavoriteTools, object: nil
         )
+        NotificationCenter.default.addObserver(
+            self, selector: #selector(handleShowOutputDirectory),
+            name: .showOutputDirectory, object: nil
+        )
 
         // Finder "Add to AI Drop" Quick Action → opens Stage 2 with the selected files.
         NotificationCenter.default.addObserver(
@@ -131,6 +135,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     @objc private func handleShowHotkeyPicker()  { showHotkeyPicker()  }
     @objc private func handleShowCustomDisable() { showCustomDisable() }
     @objc private func handleShowFavoriteTools() { showSettings(section: .favoriteTools) }
+    @objc private func handleShowOutputDirectory() { showSettings(section: .outputDirectory) }
 
     // MARK: - Finder "Add to AI Drop" Quick Action
 
@@ -674,7 +679,10 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         SessionHistoryStore.shared.remove(id: id)
     }
 
-    @objc private func menuClearHistory() { SessionHistoryStore.shared.clear() }
+    @objc private func menuClearHistory() {
+        guard confirmDestructive(title: "Clear Session History?") else { return }
+        SessionHistoryStore.shared.clear()
+    }
 
     // MARK: Clipboard-history actions
 
@@ -692,7 +700,10 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         ClipboardHistoryStore.shared.remove(id: id)
     }
 
-    @objc private func menuClearClipboard() { ClipboardHistoryStore.shared.clear() }
+    @objc private func menuClearClipboard() {
+        guard confirmDestructive(title: "Clear Clipboard History?") else { return }
+        ClipboardHistoryStore.shared.clear()
+    }
 
     /// Flip clipboard capture on/off — keeps the poll timer and the ⌃⌘V hotkey in lockstep.
     @objc private func menuToggleClipboard() {
@@ -1356,9 +1367,44 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
         settingsWindow?.title = section.windowTitle
         settingsWindow?.setContentSize(size)
-        settingsWindow?.center()
+        if let win = settingsWindow { positionSettingsWindow(win) }
         settingsWindow?.makeKeyAndOrderFront(nil)
         NSApp.activate(ignoringOtherApps: true)
+    }
+
+    /// Place the Settings window so it never hides behind the (horizontally-centred)
+    /// overlay panel: sit it just to the RIGHT of the panel, top-aligned. Falls back to
+    /// the panel's left side, then a plain centre, when the screen can't fit it on the
+    /// right. Centres normally when no overlay is on screen.
+    private func positionSettingsWindow(_ win: NSWindow) {
+        let screen = overlayWindow?.screen ?? win.screen ?? NSScreen.main
+        guard let vf = screen?.visibleFrame else { win.center(); return }
+
+        let s = win.frame.size
+        let margin: CGFloat = 8
+        var origin: NSPoint
+
+        if let overlay = overlayWindow, overlay.isVisible {
+            let gap: CGFloat = 16
+            let of = overlay.frame
+            let top = of.maxY - s.height          // align tops
+            let rightX = of.maxX + gap
+            let leftX  = of.minX - gap - s.width
+            if rightX + s.width <= vf.maxX - margin {
+                origin = NSPoint(x: rightX, y: top)                       // fits to the right
+            } else if leftX >= vf.minX + margin {
+                origin = NSPoint(x: leftX, y: top)                        // else to the left
+            } else {
+                origin = NSPoint(x: vf.midX - s.width / 2, y: top)        // neither — centre x
+            }
+        } else {
+            origin = NSPoint(x: vf.midX - s.width / 2, y: vf.midY - s.height / 2)
+        }
+
+        // Keep the whole window on-screen.
+        origin.x = min(max(origin.x, vf.minX + margin), vf.maxX - s.width  - margin)
+        origin.y = min(max(origin.y, vf.minY + margin), vf.maxY - s.height - margin)
+        win.setFrameOrigin(origin)
     }
 
     /// Per-section window height. The scoped sections are short; `.all` is the full
@@ -1366,11 +1412,12 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private func settingsSize(for section: SettingsSection) -> NSSize {
         let h: CGFloat
         switch section {
-        case .all:           h = 640
-        case .windowSize:    h = 240
-        case .customPrompt:  h = 360
-        case .favoriteTools: h = 520
-        case .aiProvider:    h = 480
+        case .all:             h = 640
+        case .windowSize:      h = 240
+        case .customPrompt:    h = 360
+        case .favoriteTools:   h = 520
+        case .outputDirectory: h = 360
+        case .aiProvider:      h = 480
         }
         return NSSize(width: 460, height: h)
     }
@@ -1469,6 +1516,7 @@ extension Notification.Name {
     static let showHotkeyPicker = Notification.Name("com.aidrop.showHotkeyPicker")
     static let showCustomDisable = Notification.Name("com.aidrop.showCustomDisable")
     static let showFavoriteTools = Notification.Name("com.aidrop.showFavoriteTools")
+    static let showOutputDirectory = Notification.Name("com.aidrop.showOutputDirectory")
     static let addFilesFromShare = Notification.Name("com.aidrop.addFilesFromShare")
 }
 

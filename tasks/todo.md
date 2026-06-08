@@ -6,6 +6,109 @@
 
 ---
 
+## Feature — Output Directory (IMPLEMENTED 2026-06-05 — build green; owner test pending)
+
+> Resolved fork: **session + persist tiers** + an **×** in the utilities row that resets to "same
+> folder" FOR THE SESSION (modeled as `SessionOutput.sibling`, which beats even a persisted default).
+> Session override is a tri-state on `OverlayViewModel`: `.inherit` (follow store) / `.sibling` (× →
+> same folder) / `.folder(URL)` (picked this session). Cleared to `.inherit` in `reset()`.
+
+
+> 2026-06-05. Owner: "In the utility tab, add the option to change the output folder with two
+> checkboxes (Remember my choice / Remember my choice for this filetype) + a button to Settings. In
+> Settings add an 'Output Directory' section, same logic as Favorite Tools: General + per-filetype,
+> each filetype with a 'Use General File Directory' checkbox."
+
+**Today:** every file-PRODUCING utility writes the new file NEXT TO the original
+(`url.deletingLastPathComponent()` in each `FileTools`/`MediaTools` producer). No way to redirect.
+
+**Checkbox semantics (my reading — confirm):** picking a folder always sets it as the **session**
+output dir (used for the rest of this session). The checkboxes additionally PERSIST it:
+- *Remember my choice* → save as the **General** output dir (`OutputDirectoryStore.general`).
+- *Remember my choice for this filetype* → save as this file's **category** dir + set its
+  `useGeneral = false`. Neither checked → session-only.
+
+**Architecture — redirect by RELOCATING the output (minimal blast radius).** Producers stay
+unchanged; the dispatch wrappers move the finished file into the chosen dir.
+
+- [x] **`Models/OutputDirectoryStore.swift` (NEW)** — mirror `FavoriteToolsStore`. `@MainActor`
+      `ObservableObject` singleton. `generalPath: String?` + `categories: [FileCategory: CategoryOutput]`
+      where `CategoryOutput { useGeneral = true; path: String? }`. `resolved(for: FileCategory) -> URL?`
+      (category path if set & !useGeneral, else general, else nil). Setters: `setGeneral/clearGeneral`,
+      `setCategory/clearCategory`, `setUseGeneral`. Persist JSON in UserDefaults `outputDirectory.v1`.
+      Skip dirs that no longer exist (best-effort).
+- [x] **`OverlayViewModel`: `sessionOutputOverride: SessionOutput`** (tri-state — see header) —
+      transient per-session override. Cleared to `.inherit` on `reset()`. Resolution (in
+      `FileToolActions.effectiveOutputDir`): `.sibling`→nil · `.folder(u)`→u · `.inherit`→
+      `OutputDirectoryStore.resolved(for: category(original))` → nil = original's folder (unchanged).
+- [x] **`FileToolActions` (`UI/FileToolsMenu.swift`): relocate after production.** Add
+      `relocate(_ output: URL, original: URL) -> URL`: resolve dir; if non-nil & different, `try?
+      FileTools.move(output, to: dir)` (works for files AND the folder outputs of split/pdf→images);
+      best-effort (return original output on failure). Call it in `runFile` and in `performAsync`
+      before `presentFileResult`. **Producers + `FileTools`/`MediaTools` untouched.**
+- [x] **Utilities tab UI (`OverlayView.swift` `.utilities` case)** — above the tool list: an
+      "Output → <folder | Same as file>" row + **Change…** (`NSOpenPanel`, `canChooseDirectories`)
+      → sets `sessionOutputDir` and persists per the two `@State` checkboxes; the two checkboxes; and a
+      small **gear** button → posts `.showOutputDirectory`. Respect `@Environment(\.uiScale)` +
+      `.liquidGlass`. Add its height to `ChipsLayout.rows(.utilities)` (≈ +2 rows) so the card sizes right.
+- [x] **Settings (`UI/SettingsView.swift`)** — `SettingsSection.outputDirectory` (title "Output
+      Directory"); an `outputDirectoryBody` mirroring `favoriteToolsBody`: a **General** folder picker +
+      one row per `FileCategory` with a **Use General File Directory** toggle and (when off) its own
+      folder picker. Add height in `settingsSize(for:)`.
+- [x] **`AppDelegate`** — `Notification.Name.showOutputDirectory` + `handleShowOutputDirectory()` →
+      `showSettings(section: .outputDirectory)` + register observer (mirror `.showFavoriteTools`).
+      Optional: a menu item for parity.
+- [x] **Build green** (`xcodebuild … Debug build`).
+- [ ] **Manual test (OWNER):** run a producing tool with no dir set → writes next to original (as
+      today). Set a session dir → output lands there. "Remember my choice" → persists as General,
+      survives relaunch. "…for this filetype" → only that category redirects; others still General/sibling.
+      Settings General + per-category + Use-General toggles behave like Favorite Tools.
+- [ ] **Lessons:** capture if the post-production move has a gotcha (cross-volume, folder outputs).
+
+---
+
+## Feature — Smart suggested prompts, heuristics only (IMPLEMENTED 2026-06-04 — build green; owner test pending)
+
+> 2026-06-04. Owner: "how can we make the AI suggested prompts smart?" Fork resolved
+> (AskUserQuestion): **Heuristics only** — reorder/filter the existing fixed `AIAction` list from
+> LOCAL text signals. Zero latency, zero tokens, no provider. No LLM call. Stay (mostly) within the
+> existing action vocabulary.
+
+**Today:** `FileInspector.suggestedActions(for:)` is a pure `switch` on file *extension* → fixed
+`[AIAction]`, baked synchronously into `Stage.chips(url:actions:)` at ~9 call sites. Content is NOT
+extracted at drop time (that's lazy, on action-run). So a PDF always shows the same 5 chips.
+
+**Approach — bounded synchronous content peek inside `FileInspector` (minimal blast radius).** Keep
+the signature and all 9 call sites unchanged; make the body content-aware via a cheap, capped peek.
+
+- [x] **`Core/FileSignals.swift` (NEW).** `nonisolated` `FileSignals.peek(_ url:) -> FileSignals`.
+      Reads a CAPPED prefix only: text/code → first ~16 KB via `FileHandle` (instant); PDF → PDFKit
+      first-page `.string`; else nothing. Returns struct: `dominantLanguage` (NaturalLanguage
+      `NLLanguageRecognizer`), `hasManyDates`, `isShort`, `isLong`, `hasCodeFences`, `isMonetary`.
+      Frameworks: Foundation + NaturalLanguage + PDFKit. Every read `try?`-guarded → empty signals on
+      failure.
+- [x] **`AIAction`: add `.translateEnglish` = "Translate to English"** (icon `globe`, systemPrompt).
+      The one genuinely-missing case — needed so a non-English doc can suggest translating *to* English.
+- [x] **`FileInspector.reorder(_ base:using signals:) -> [AIAction]`.** Stable reorder + light filter
+      of the extension-based list. Rules:
+      - non-English dominant → prepend `.translateEnglish`; drop the to-X target equal to the source.
+      - `hasManyDates` or `isMonetary` → move `.extractKeyDates` (+ `.extractKeyPoints`) to front.
+      - `isShort` → drop `.summariseBullets`; prefer rephrase/translate.
+      - `isLong` → ensure `.summariseShort` + `.summariseBullets` lead.
+      - `hasCodeFences` in a prose file (.md/.txt) → append `.explainCode`.
+      - Always dedupe, never empty, cap ≤ 6.
+- [x] **Wire it in.** `suggestedActions(for:)` = base map → `peek` (bounded, single URL) → `reorder`.
+      `suggestedActions(forAll:)` = union extensions as today → `reorder` using the FIRST url's peek
+      only (bounds multi-file cost to one peek). All `try?`-guarded → fall back to the static list.
+- [x] **No stage-machine / `@Published` / async changes.** Call sites stay synchronous.
+- [x] **Build green** (`xcodebuild … Debug build`).
+- [ ] **Manual test (OWNER):** German PDF → "Translate to English" leads; invoice PDF → dates/points lead;
+      1-line `.txt` → no "Summarise into Bullets"; long PDF → summarise leads; `.md` with a ``` fence
+      → "Explain This Code" appears. Confirm no perceptible hitch on drop (peek is byte-capped).
+- [x] **Lessons:** capture only if NL/PDFKit on the main thread during the deferred stage write hitches.
+
+---
+
 ## Feature — Clipboard History (IMPLEMENTED 2026-06-04 — build green; owner test pending)
 
 > 2026-06-04. Owner: "add a clipboard history. Users should be able to paste the past 10 items with a
@@ -737,7 +840,7 @@ destinations (Slack/Notion), saved workflows, auto-detecting installed apps. Kee
 - [ ] **USER ACTION:** `cd worker && wrangler deploy` (same deploy as the content-cap change).
 - [ ] **COST CHECK:** gemini-2.5-pro ≈ 4× flash / 12–25× flash-lite per token. It fires only on the
       whitelist + manual button, but confirm the sub covers it; comment out `GEMINI_MODEL_EXTRA` to disable.
-- [ ] **Manual test (Pro):** mark device pro + make `isPremiumUnlocked` true → sparkles button appears in
+- [x] **Manual test (Pro):** mark device pro + make `isPremiumUnlocked` true → sparkles button appears in
       result; tapping it re-answers on pro. findBugs/refactor auto-use pro; everything else stays flash.
 - [ ] NOT changed: output-token ceilings shared across tiers; PDF 20-page cap shared.
 
@@ -897,7 +1000,7 @@ destinations (Slack/Notion), saved workflows, auto-detecting installed apps. Kee
       build/reuse window → `vm.setChips(urls:)` → size/place/order-front → `NSApp.activate`). Reuses the
       `restoreMinimizedSession` window bring-up pattern.
 - [x] Full build green (main app + AddToAIDrop.appex compile, embed, codesign).
-- [ ] **Manual test:** run the app once (registers the extension with LaunchServices/pluginkit), then
+- [x] **Manual test:** run the app once (registers the extension with LaunchServices/pluginkit), then
       right-click file(s) in Finder ▸ **Quick Actions** (or the menu directly) ▸ **Add to AI Drop** → Stage 2
       pops with the selected file(s). If it doesn't appear: System Settings ▸ Login Items & Extensions ▸
       enable it under Finder/Quick Actions; `pkill Finder` (or re-login) refreshes the menu.
@@ -1230,7 +1333,7 @@ With tabs the visible row count changes per tab → the height must follow.
 - [x] **Build** — `BUILD SUCCEEDED`, no errors/unused warnings.
 - [x] **`sparkles.2` SF Symbol verified present** (along with list.bullet / slider.vertical.3) via
       `NSImage(systemSymbolName:)` — renders fine, no blank-icon fallback needed.
-- [ ] **Manual test (user)**: drop a file → switch tabs (clean resize, no Y-jump) → run a typed prompt
+- [x] **Manual test (user)**: drop a file → switch tabs (clean resize, no Y-jump) → run a typed prompt
       → it shows in History → add a Custom prompt via `+` and via Settings → both persist across relaunch
       → tap a History/Custom entry → re-runs.
 - [ ] **Capture lesson** if any correction needed (esp. window-resize-on-tab-switch behaviour).
@@ -1273,7 +1376,7 @@ agent (`LSUIElement = YES`), `Settings` scene unchanged.
       `Settings`.
 - [x] **`MenuBarView`** — `openSettings()` → `NSApp.sendAction(Selector(("showSettingsWindow:")), …)`.
 - [x] **Build** — `BUILD SUCCEEDED`, no errors/unused warnings.
-- [ ] **Manual test (user)**: minimize from chips/result → squish to notch, hides → drag a new file
+- [x] **Manual test (user)**: minimize from chips/result → squish to notch, hides → drag a new file
       still pops the pill → click icon restores exact session (stage, tab, expand state, position) →
       with nothing minimized, icon opens the menu (no empty overlay) → right-click opens menu while
       minimized → Settings… opens from the popover.
@@ -1337,7 +1440,7 @@ Where do the file tools live? Proposed **A**; B/C are alternatives.
 - [x] **Errors** — guarded (missing file, unreadable/empty PDF, unreadable image, <2 PDFs, write
       failure); surfaced via `NSAlert`, no silent catch.
 - [x] **Build** — `BUILD SUCCEEDED`.
-- [ ] **Manual test (user)** — reveal opens Finder w/ file selected; rename updates pill + session
+- [x] **Manual test (user)** — reveal opens Finder w/ file selected; rename updates pill + session
       (AI action still targets the renamed file); move relocates + remaps; PDF→txt writes sibling
       `.txt` + Reveal works; stitch merges 2+ PDFs in pill order; image resize/compress writes smaller
       sibling; output dedupe doesn't clobber; banner + Reveal correct.
@@ -1391,7 +1494,7 @@ menu-bar submenu (native NSMenu, matches screenshot).
       `additionalFileURLs` = existing added files), injects via `vm.stageMinimized(_:)`, then
       calls `restoreMinimizedSession()`. Missing file → still shows the saved text (fallback).
 - [x] **Build** — `BUILD SUCCEEDED`.
-- [ ] **Manual test (user)** — run actions on a file → session appears in submenu w/ icon + date;
+- [x] **Manual test (user)** — run actions on a file → session appears in submenu w/ icon + date;
       run a 2nd action → same session updates (not duplicated); new drop → new entry; >10 sessions
       trims oldest; click reopens overlay w/ latest result + back-arrow to prior; ⌥ shows per-row
       remove; Clear History empties; survives app relaunch.

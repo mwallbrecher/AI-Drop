@@ -196,6 +196,17 @@ class OverlayViewModel: ObservableObject {
         return [primary] + additionalFileURLs
     }
 
+    /// Where file-utility outputs go FOR THIS SESSION (overrides the persisted
+    /// `OutputDirectoryStore`). `.inherit` = follow the store; `.sibling` = force "next to
+    /// the original" (the × reset, even over a persisted default); `.folder` = a folder the
+    /// user picked this session. Reset to `.inherit` on a fresh session.
+    enum SessionOutput: Equatable {
+        case inherit
+        case sibling
+        case folder(URL)
+    }
+    @Published var sessionOutputOverride: SessionOutput = .inherit
+
     // ── Jelly wobble ─────────────────────────────────────────────────────────
     // Applied to the pill scaleEffect in OverlayView (outside clipShape so it
     // overflows into the transparent canvas without hitting NSHostingView clip).
@@ -319,9 +330,11 @@ class OverlayViewModel: ObservableObject {
     /// Return to the chips stage from the file-utility result stage. Rebuilds the
     /// suggested actions for the whole session so the user can run another tool or an
     /// AI action on the same file(s). The output file is not added to the session.
+    /// Caches the result (like the AI path's `navigateBackToChips`) so the chips header's
+    /// → button can restore the utility result without re-running the tool.
     func returnToChips() {
         guard let primary = stage.fileURL else { return }
-        cachedResult = nil
+        cachedResult = stage   // keep the utility result so → can bring it back
         stage = .chips(url: primary,
                        actions: FileInspector.suggestedActions(forAll: [primary] + additionalFileURLs))
         customPrompt = ""
@@ -419,6 +432,8 @@ class OverlayViewModel: ObservableObject {
             switch cached {
             case .result(let u, let a, let t): cachedResult = .result(url: remap(u), action: a, text: t)
             case .chips(let u, let acts):      cachedResult = .chips(url: remap(u), actions: acts)
+            case .fileResult(let o, let out, let t):
+                cachedResult = .fileResult(original: remap(o), output: remap(out), tool: t)
             default: break
             }
         }
@@ -469,6 +484,7 @@ class OverlayViewModel: ObservableObject {
         conversation          = []
         baseContext           = nil
         isAwaitingReply       = false
+        sessionOutputOverride = .inherit   // fresh session → follow the persisted store
         jellyX              = 1.0
         jellyY         = 1.0
         isCollapsing   = false
@@ -516,9 +532,9 @@ enum ChipsLayout {
                      suggested: Int, history: Int, custom: Int, utilities: Int) -> Int {
         switch tab {
         case .suggested: return max(suggested, 1)
-        case .history:   return history == 0 ? 1 : history
+        case .history:   return history == 0 ? 1 : history + 1   // +1 = "Clear All" footer row
         case .custom:    return custom + 1
-        case .utilities: return max(utilities, 1)
+        case .utilities: return max(utilities, 1) + 1   // +1 ≈ the output-folder row
         }
     }
 }

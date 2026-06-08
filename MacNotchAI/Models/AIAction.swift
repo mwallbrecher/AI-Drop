@@ -6,6 +6,7 @@ enum AIAction: String, CaseIterable, Identifiable {
     case summariseShort     = "Summarise in 1 Sentence"
     case extractKeyDates    = "Extract Key Dates"
     case extractKeyPoints   = "Extract Key Points"
+    case translateEnglish   = "Translate to English"
     case translateGerman    = "Translate to German"
     case translateFrench    = "Translate to French"
     case translateSpanish   = "Translate to Spanish"
@@ -39,6 +40,7 @@ enum AIAction: String, CaseIterable, Identifiable {
         case .summariseShort:       return "text.alignleft"
         case .extractKeyDates:      return "calendar"
         case .extractKeyPoints:     return "list.number"
+        case .translateEnglish:     return "globe"
         case .translateGerman:      return "globe"
         case .translateFrench:      return "globe"
         case .translateSpanish:     return "globe"
@@ -65,6 +67,8 @@ enum AIAction: String, CaseIterable, Identifiable {
             return "Extract all dates, deadlines, and time references from the following content. Present them as a clean list."
         case .extractKeyPoints:
             return "Extract the 5 most important key points from the following content as a numbered list."
+        case .translateEnglish:
+            return "Translate the following text to English. Preserve formatting."
         case .translateGerman:
             return "Translate the following text to German. Preserve formatting."
         case .translateFrench:

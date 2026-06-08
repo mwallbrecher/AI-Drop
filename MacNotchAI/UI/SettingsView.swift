@@ -5,16 +5,17 @@ import UniformTypeIdentifiers
 /// scoped to a single setting (`.windowSize` / `.customPrompt` / `.favoriteTools` /
 /// `.aiProvider`); the system ⌘, Settings scene still shows everything (`.all`).
 enum SettingsSection: String {
-    case all, windowSize, customPrompt, favoriteTools, aiProvider
+    case all, windowSize, customPrompt, favoriteTools, outputDirectory, aiProvider
 
     /// Title for the settings window when opened scoped to this section.
     var windowTitle: String {
         switch self {
-        case .all:           return "AI Drop Settings"
-        case .windowSize:    return "Window Size"
-        case .customPrompt:  return "Custom Prompts"
-        case .favoriteTools: return "Favorite Tools"
-        case .aiProvider:    return "AI Provider"
+        case .all:             return "AI Drop Settings"
+        case .windowSize:      return "Window Size"
+        case .customPrompt:    return "Custom Prompts"
+        case .favoriteTools:   return "Favorite Tools"
+        case .outputDirectory: return "Output Directory"
+        case .aiProvider:      return "AI Provider"
         }
     }
 }
@@ -28,6 +29,7 @@ struct SettingsView: View {
     @AppStorage("uiScale")          private var uiScaleRaw       = UIScale.small.rawValue
     @ObservedObject private var promptStore = PromptStore.shared
     @ObservedObject private var toolsStore  = FavoriteToolsStore.shared
+    @ObservedObject private var outputStore = OutputDirectoryStore.shared
     @State private var apiKey = ""
     @State private var ollamaAvailable = false
     @State private var saved = false
@@ -35,6 +37,8 @@ struct SettingsView: View {
     /// Which favorite-tools tab is showing. `.general` = the shared list; a category
     /// case = that file type's own list (with its Use-General toggle).
     @State private var favTab: FavTab = .general
+    /// Which Output Directory tab is showing (reuses `FavTab`: General + per-category).
+    @State private var outTab: FavTab = .general
 
     /// Selection for the Favorite Tools tab picker.
     private enum FavTab: Hashable {
@@ -147,6 +151,25 @@ struct SettingsView: View {
                 .padding(.bottom, 4)
 
                 favoriteToolsBody
+            }
+            }
+
+            if shows(.outputDirectory) {
+            Section(header: Text("Output Directory"),
+                    footer: Text("Where file-utility outputs are saved. Set a General folder, or give a file type its own. Empty = save next to the original file (the default).")
+                        .font(.caption2)
+                        .foregroundColor(.secondary)) {
+                Picker("", selection: $outTab) {
+                    Text("General").tag(FavTab.general)
+                    ForEach(FileCategory.allCases, id: \.self) { c in
+                        Text(c.title).tag(FavTab.category(c))
+                    }
+                }
+                .pickerStyle(.segmented)
+                .labelsHidden()
+                .padding(.bottom, 4)
+
+                outputDirectoryBody
             }
             }
 
@@ -302,6 +325,80 @@ struct SettingsView: View {
             Label("Add App…", systemImage: "plus")
         }
         .disabled(toolsStore.tools(for: category).count >= FavoriteToolsStore.maxTools)
+    }
+
+    /// Body of the Output Directory section for the selected tab — mirrors
+    /// `favoriteToolsBody`: General shows just its folder; a category shows a
+    /// "Use General File Directory" toggle, then a note or its own folder picker.
+    @ViewBuilder private var outputDirectoryBody: some View {
+        switch outTab {
+        case .general:
+            outputDirField(for: nil)
+        case .category(let c):
+            Toggle("Use General File Directory", isOn: Binding(
+                get: { outputStore.useGeneral(for: c) },
+                set: { outputStore.setUseGeneral($0, for: c) }
+            ))
+            if outputStore.useGeneral(for: c) {
+                Text("\(c.title) files use your General output folder.")
+                    .font(.caption)
+                    .foregroundColor(.secondary)
+            } else {
+                outputDirField(for: c)
+            }
+        }
+    }
+
+    /// The folder row + Choose/Change + Clear for a scope (`nil` = General).
+    @ViewBuilder private func outputDirField(for category: FileCategory?) -> some View {
+        let path = outputStore.path(for: category)
+        HStack(spacing: 10) {
+            Image(systemName: path != nil ? "folder.fill" : "folder")
+                .foregroundColor(path != nil ? .accentColor : .secondary)
+            VStack(alignment: .leading, spacing: 1) {
+                Text(OutputDirectoryStore.displayName(for: path) ?? "Save next to the original file")
+                    .font(.system(size: 13))
+                    .lineLimit(1)
+                if let path {
+                    Text(path)
+                        .font(.system(size: 10))
+                        .foregroundColor(.secondary)
+                        .lineLimit(1)
+                        .truncationMode(.middle)
+                }
+            }
+            Spacer()
+            if path != nil {
+                Button(role: .destructive) {
+                    if let c = category { outputStore.clearCategory(for: c) }
+                    else { outputStore.clearGeneral() }
+                } label: {
+                    Image(systemName: "trash")
+                }
+                .buttonStyle(.borderless)
+                .foregroundColor(.red)
+                .help("Clear")
+            }
+        }
+        Button {
+            pickOutputDir(for: category)
+        } label: {
+            Label(path == nil ? "Choose Folder…" : "Change Folder…", systemImage: "folder.badge.plus")
+        }
+    }
+
+    /// Pick an output folder for a scope (`nil` = General).
+    private func pickOutputDir(for category: FileCategory?) {
+        let panel = NSOpenPanel()
+        panel.title = "Choose output folder"
+        panel.prompt = "Choose"
+        panel.canChooseDirectories = true
+        panel.canChooseFiles = false
+        panel.allowsMultipleSelection = false
+        if panel.runModal() == .OK, let url = panel.url {
+            if let c = category { outputStore.setCategory(url, for: c) }
+            else { outputStore.setGeneral(url) }
+        }
     }
 
     private func addCustomPrompt() {

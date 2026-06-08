@@ -72,7 +72,7 @@ extension AIAction {
             return RoutingPlan(tier: .fast, taskClass: .summarisation, maxOutputTokens: 512)
 
         // ── Transformation: mechanical, output ≈ input → cheap model ──────────
-        case .translateGerman, .translateFrench, .translateSpanish,
+        case .translateEnglish, .translateGerman, .translateFrench, .translateSpanish,
              .rephraseFormal, .rephraseCasual, .addDocstring:
             return RoutingPlan(tier: .fast, taskClass: .transformation, maxOutputTokens: 4096)
 
